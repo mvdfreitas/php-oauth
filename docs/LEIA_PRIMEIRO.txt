@@ -1,0 +1,62 @@
+🔐 SERVIDOR OAUTH2 COMPLETO EM PHP PURO
+========================================
+
+📁 ARQUIVOS PRINCIPAIS:
+
+1. server/oauth2_complete.php  ← Servidor OAuth2 (Porta 8000)
+2. client/oauth2_client.php    ← Cliente Web (Porta 8001)
+
+📁 DOCUMENTAÇÃO (pasta docs/):
+
+- QUICK_REFERENCE.md     ← Comece por aqui! (Este arquivo)
+- GUIA_CLIENTE.md        ← Como usar o cliente em detalhes
+- PARAMETROS.md          ← Todos os parâmetros OAuth2
+- QUICKSTART.md          ← Começar muito rápido
+
+⚡ 3 PASSOS PARA COMEÇAR:
+
+Terminal 1 (Servidor):
+  php -S localhost:8000 server/oauth2_complete.php
+
+Terminal 2 (Cliente):
+  php -S localhost:8001 client/oauth2_client.php
+
+Browser (Teste):
+  http://localhost:8001/client/oauth2_client.php
+
+🔑 CREDENCIAIS:
+
+Usuário 1:      usuario1 / senha123
+Usuário 2:      usuario2 / senha456
+Client ID:      cliente_teste
+Client Secret:  senha_secreta_123
+
+🎯 4 GRANT TYPES INCLUSOS:
+
+1. Authorization Code   ← Mais seguro (web apps)
+2. Implicit Flow        ← Para SPAs
+3. Password Flow        ← Apps desktop/mobile
+4. Client Credentials   ← Backend-to-backend
+
+✅ TUDO FUNCIONA:
+
+✓ Login com formulário
+✓ Tokens (access + refresh)
+✓ UserInfo endpoint
+✓ Múltiplos scopes (profile, email, phone, address)
+✓ NONCE + STATE (segurança)
+✓ Renovar tokens
+✓ Debug page
+✓ Well-Known discovery
+
+📖 ONDE COMEÇAR:
+
+1. Leia QUICK_REFERENCE.md (resumido)
+2. Teste no browser: http://localhost:8001/client/oauth2_client.php
+3. Teste todos os 4 flows
+4. Leia GUIA_CLIENTE.md (detalhado)
+5. Consulte PARAMETROS.md (referência)
+
+🚀 BOM DIVERTIMENTO!
+
+Perguntas? Consulte a documentação incluída.
