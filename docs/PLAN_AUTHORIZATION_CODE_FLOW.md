@@ -2,7 +2,7 @@
 
 **Stack:** `server/oauth2_complete.php` + `client/oauth2_client.php`
 **Data:** 2026-10-09
-**Status:** Planejamento (sem codificação)
+**Status:** Implementado (2026-10-11)
 
 ---
 
@@ -299,3 +299,32 @@ O Authorization Code Flow na stack completa segue a sequência:
 - Outros grant types (implicit, password, client credentials)
 - Mudanças de estrutura de pastas (já concluído)
 - Banco de dados real (manter storage JSON)
+
+---
+
+## Parte 4 — Status de Implementação (2026-10-11)
+
+| # | Melhoria | Status | Onde |
+|---|----------|--------|------|
+| 1 | State/nonce handling | ✅ | Erros do servidor devolvem `error`+`state` via redirect (`redirectWithError`); cliente já aborta em mismatch e valida `nonce` |
+| 2 | Consent form | ✅ | `showLoginForm` sem `consent=1`; `showConsentForm` sem `password`; login (sessão) separado do consentimento; recusa via `consent=0`; memória de consentimento por client |
+| 3 | PKCE (RFC 7636) | ✅ | Servidor aceita/valida `code_challenge` (S256/plain) e exige `code_verifier`; cliente gera verifier/challenge |
+| 4 | Refresh rotation + revoke | ✅ | Rotação a cada uso, `expires_at` (30 dias), endpoint `?action=revoke` (RFC 7009) com cascata para access tokens |
+| 5 | JWT assinado | ✅ | Já era HS256; adicionado claim `auth_time`; `well-known` anuncia `HS256` |
+
+Pendências menores também resolvidas: `code_expires` agora vem do `$config`; `well-known` aponta para `oauth2_complete.php` e anuncia `revocation_endpoint` e `code_challenge_methods_supported`.
+
+### Como testar manualmente
+
+```bash
+php -S localhost:8000 server/oauth2_complete.php
+php -S localhost:8001 client/oauth2_client.php
+# Acesse http://localhost:8001/oauth2_client.php → flow=code
+# Após login: consentimento → código → token (com PKCE) → userinfo
+# Botões "Renovar Token" (rotação) e "Revogar Token"
+```
+
+### Fora de escopo remanescente
+
+- Senhas de `$users` ainda em plaintext (problema #6 da Parte 1) — só faz sentido junto com um armazenamento real/`password_hash`.
+- Debug page mantém exemplos com `redirect_uri=.../index.php` (URI válida registrada).
