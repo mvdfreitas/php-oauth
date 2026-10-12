@@ -15,6 +15,8 @@ $config = [
     'access_token_expires' => 3600,      // 1 hora
     'refresh_token_expires' => 2592000,  // 30 dias
     'code_expires' => 600,               // 10 minutos
+    'device_code_expires' => 600,        // 10 minutos (RFC 8628)
+    'device_polling_interval' => 5,      // 5 segundos (RFC 8628)
     'jwt_secret' => 'segredo_jwt_local_dev_1234567890', // HS256 (apenas para estudo)
 ];
 
@@ -63,11 +65,11 @@ $clients = [
             'http://localhost:3000/callback',
         ],
         'response_types' => ['code', 'token', 'id_token', 'id_token token'],
-        'grant_types' => ['authorization_code', 'refresh_token', 'implicit'],
-        'token_endpoint_auth_method' => 'client_secret_basic',
-        'logo_uri' => 'https://via.placeholder.com/200',
-        'contacts' => ['admin@example.com'],
-    ],
+    'grant_types' => ['authorization_code', 'refresh_token', 'implicit', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code'],
+    'token_endpoint_auth_method' => 'client_secret_basic',
+    'logo_uri' => 'https://via.placeholder.com/200',
+    'contacts' => ['admin@example.com'],
+],
 ];
 
 // Escopos disponíveis e suas claims
@@ -122,6 +124,21 @@ function generateCode() {
 
 function generateToken() {
     return bin2hex(random_bytes(32));
+}
+
+function generateDeviceCode() {
+    return bin2hex(random_bytes(16));
+}
+
+function generateUserCode() {
+    // Gera código no formato XXXX-XXXX (8 caracteres alfanuméricos legíveis)
+    // Evita caracteres ambíguos (0, O, I, 1) para melhor legibilidade
+    $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    $code = '';
+    for ($i = 0; $i < 8; $i++) {
+        $code .= $chars[random_int(0, strlen($chars) - 1)];
+    }
+    return substr($code, 0, 4) . '-' . substr($code, 4, 4);
 }
 
 function createAccessToken(array &$storage, $client_id, $username, $scope, $expires_in = 3600) {
@@ -1022,6 +1039,62 @@ function handleToken() {
         $scope = $_POST['scope'] ?? 'openid profile';
         $username = $client_id; // Usar client_id como username
     }
+    // ======================== Device Authorization Grant (RFC 8628) ========================
+    elseif ($grant_type === 'urn:ietf:params:oauth:grant-type:device_code' || $grant_type === 'device_code') {
+        $device_code = $_POST['device_code'] ?? null;
+
+        if (!$device_code) {
+            return jsonResponse(['error' => 'invalid_request', 'error_description' => 'device_code ausente'], 400);
+        }
+
+        if (!isset($storage['device_codes'][$device_code])) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'device_code inválido'], 400);
+        }
+
+        $device_data = $storage['device_codes'][$device_code];
+
+        if ($device_data['client_id'] !== $client_id) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'device_code não pertence a este cliente'], 400);
+        }
+
+        if (time() > $device_data['expires_at']) {
+            unset($storage['device_codes'][$device_code]);
+            saveStorage($storage);
+            return jsonResponse(['error' => 'expired_token', 'error_description' => 'device_code expirado'], 400);
+        }
+
+        // Slow down: se polling muito rápido
+        $now = time();
+        if ($device_data['last_poll'] > 0 && ($now - $device_data['last_poll']) < $device_data['interval']) {
+            $storage['device_codes'][$device_code]['last_poll'] = $now;
+            saveStorage($storage);
+            return jsonResponse(['error' => 'slow_down', 'error_description' => 'Polling muito rápido'], 400);
+        }
+
+        $storage['device_codes'][$device_code]['last_poll'] = $now;
+        saveStorage($storage);
+
+        if ($device_data['status'] === 'pending') {
+            return jsonResponse(['error' => 'authorization_pending', 'error_description' => 'Autorização ainda pendente'], 400);
+        }
+
+        if ($device_data['status'] === 'denied') {
+            unset($storage['device_codes'][$device_code]);
+            saveStorage($storage);
+            return jsonResponse(['error' => 'access_denied', 'error_description' => 'Usuário negou a autorização'], 400);
+        }
+
+        if ($device_data['status'] === 'approved') {
+            $username = $device_data['username'];
+            $scope = $device_data['scope'];
+            $nonce = null; // Device flow não usa nonce tipicamente
+
+            // Remove device_code após uso (one-time use)
+            unset($storage['device_codes'][$device_code]);
+        } else {
+            return jsonResponse(['error' => 'authorization_pending', 'error_description' => 'Autorização ainda pendente'], 400);
+        }
+    }
     else {
         return jsonResponse(['error' => 'unsupported_grant_type', 'error_description' => 'Grant type não suportado'], 400);
     }
@@ -1211,18 +1284,19 @@ function handleWellKnown() {
         'revocation_endpoint' => $base . '?action=revoke',
         'response_types_supported' => ['code', 'token', 'id_token', 'id_token token', 'code token', 'code id_token', 'code id_token token'],
         'response_modes_supported' => ['query', 'fragment'],
-        'grant_types_supported' => ['authorization_code', 'implicit', 'refresh_token', 'password', 'client_credentials'],
-        'subject_types_supported' => ['public'],
-        'id_token_signing_alg_values_supported' => ['HS256'],
-        'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
-        'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
-        'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
-        'code_challenge_methods_supported' => ['S256', 'plain'],
-        'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
-        'claim_types_supported' => ['normal'],
-        'claims_supported' => ['sub', 'name', 'email', 'email_verified', 'phone_number', 'phone_number_verified', 'address', 'picture', 'locale'],
-        'claim_parameter_supported' => true,
-    ]);
+    'grant_types_supported' => ['authorization_code', 'implicit', 'refresh_token', 'password', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code'],
+    'subject_types_supported' => ['public'],
+    'id_token_signing_alg_values_supported' => ['HS256'],
+    'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
+    'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+    'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+    'code_challenge_methods_supported' => ['S256', 'plain'],
+    'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
+    'claim_types_supported' => ['normal'],
+    'claims_supported' => ['sub', 'name', 'email', 'email_verified', 'phone_number', 'phone_number_verified', 'address', 'picture', 'locale'],
+    'claim_parameter_supported' => true,
+    'device_authorization_endpoint' => $base . '?action=device_code',
+]);
 }
 
 // ============================================================================
@@ -1494,6 +1568,176 @@ function handleClearStorage() {
 }
 
 // ============================================================================
+// DEVICE AUTHORIZATION GRANT (RFC 8628)
+// ============================================================================
+
+function handleDeviceAuthorization() {
+    global $clients, $config;
+
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        return jsonResponse(['error' => 'invalid_request', 'error_description' => 'Método deve ser POST'], 405);
+    }
+
+    $client_id = $_POST['client_id'] ?? null;
+    $scope = $_POST['scope'] ?? 'openid profile';
+
+    if (!$client_id || !isset($clients[$client_id])) {
+        return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client ID inválido'], 400);
+    }
+
+    $requested_scopes = parseScopes($scope);
+    $allowed_scopes = array_keys($GLOBALS['scopes_definition'] ?? []);
+
+    if (!validateScopes($requested_scopes, $allowed_scopes)) {
+        return jsonResponse(['error' => 'invalid_scope', 'error_description' => 'Scope inválido'], 400);
+    }
+
+    $storage = loadStorage();
+    $storage['device_codes'] = $storage['device_codes'] ?? [];
+
+    $device_code = generateDeviceCode();
+    $user_code = generateUserCode();
+
+    $expires_at = time() + $config['device_code_expires'];
+    $interval = $config['device_polling_interval'];
+
+    $storage['device_codes'][$device_code] = [
+        'device_code' => $device_code,
+        'user_code' => $user_code,
+        'client_id' => $client_id,
+        'scope' => $scope,
+        'status' => 'pending',
+        'username' => null,
+        'created_at' => time(),
+        'expires_at' => $expires_at,
+        'interval' => $interval,
+        'last_poll' => 0,
+    ];
+
+    saveStorage($storage);
+
+    $verification_uri = $config['base_url'] . '/oauth2_complete.php?action=device';
+    $verification_uri_complete = $verification_uri . '&user_code=' . urlencode($user_code);
+
+    return jsonResponse([
+        'device_code' => $device_code,
+        'user_code' => $user_code,
+        'verification_uri' => $verification_uri,
+        'verification_uri_complete' => $verification_uri_complete,
+        'expires_in' => $config['device_code_expires'],
+        'interval' => $interval,
+    ]);
+}
+
+function handleDevice() {
+    global $clients, $scopes_definition, $config;
+
+    $user_code = $_GET['user_code'] ?? $_POST['user_code'] ?? null;
+    $consent = $_POST['consent'] ?? null;
+
+    $storage = loadStorage();
+    $storage['device_codes'] = $storage['device_codes'] ?? [];
+
+    // Encontrar device_code pelo user_code
+    $device_data = null;
+    $device_code_key = null;
+    if ($user_code) {
+        foreach ($storage['device_codes'] as $key => $data) {
+            if (strtoupper($data['user_code']) === strtoupper($user_code)) {
+                $device_data = $data;
+                $device_code_key = $key;
+                break;
+            }
+        }
+    }
+
+    // Se não encontrou por user_code, tentar buscar por sessão ou mostrar formulário
+    if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+        if (!$device_data && !$user_code) {
+            // Mostrar formulário para inserir user_code
+            return showDeviceCodeForm();
+        }
+
+        if (!$device_data) {
+            return htmlResponse('Código do dispositivo inválido ou expirado', 400);
+        }
+
+        if (time() > $device_data['expires_at']) {
+            unset($storage['device_codes'][$device_code_key]);
+            saveStorage($storage);
+            return htmlResponse('Código do dispositivo expirado', 400);
+        }
+
+        // Verificar se já aprovado/negado
+        if ($device_data['status'] !== 'pending') {
+            return showDeviceStatus($device_data['status']);
+        }
+
+        // Verificar autenticação do usuário
+        $username = $_SESSION['oauth_authenticated_user'] ?? null;
+        if ($username === null) {
+            // Redirecionar para login com parâmetros para voltar ao device flow
+            $_SESSION['device_flow_return'] = true;
+            $_SESSION['device_user_code'] = $user_code;
+            return showDeviceLoginForm($device_data);
+        }
+
+        // Usuário autenticado, mostrar tela de consentimento
+        return showDeviceConsentForm($device_data, $username);
+    }
+
+    // POST
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!$device_data) {
+            return htmlResponse('Código do dispositivo inválido', 400);
+        }
+
+        if (time() > $device_data['expires_at']) {
+            unset($storage['device_codes'][$device_code_key]);
+            saveStorage($storage);
+            return htmlResponse('Código do dispositivo expirado', 400);
+        }
+
+        $username = $_SESSION['oauth_authenticated_user'] ?? null;
+
+        if ($consent === '0') {
+            // Negado
+            $storage['device_codes'][$device_code_key]['status'] = 'denied';
+            saveStorage($storage);
+            return showDeviceStatus('denied');
+        }
+
+        if ($consent === '1' && $username) {
+            // Aprovado
+            $storage['device_codes'][$device_code_key]['status'] = 'approved';
+            $storage['device_codes'][$device_code_key]['username'] = $username;
+            saveStorage($storage);
+            return showDeviceStatus('approved');
+        }
+
+        // Precisa autenticar
+        if ($username === null) {
+            // Processar login
+            $username_input = trim((string) ($_POST['username'] ?? ''));
+            $password = trim((string) ($_POST['password'] ?? ''));
+
+            if ($username_input !== '' && $password !== '' && isset($GLOBALS['users'][$username_input])) {
+                if (hash_equals($GLOBALS['users'][$username_input]['password'], $password)) {
+                    $_SESSION['oauth_authenticated_user'] = $username_input;
+                    $username = $username_input;
+                    return showDeviceConsentForm($device_data, $username);
+                }
+            }
+            return showDeviceLoginForm($device_data, 'Credenciais inválidas');
+        }
+
+        return showDeviceConsentForm($device_data, $username);
+    }
+
+    return htmlResponse('Método não permitido', 405);
+}
+
+// ============================================================================
 // RESPOSTA HTML SIMPLES
 // ============================================================================
 
@@ -1561,6 +1805,12 @@ switch ($action) {
     case 'well-known':
         handleWellKnown();
         break;
+    case 'device_code':
+        handleDeviceAuthorization();
+        break;
+    case 'device':
+        handleDevice();
+        break;
     case 'clear_storage':
         handleClearStorage();
         break;
@@ -1568,4 +1818,207 @@ switch ($action) {
     default:
         handleDebug();
         break;
+}
+// Device Flow Forms
+function showDeviceCodeForm() {
+    ?>
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Device Authorization</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 1rem; }
+            .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 450px; }
+            h1 { color: #333; margin-bottom: 0.5rem; font-size: 1.8rem; text-align: center; }
+            .subtitle { color: #666; text-align: center; margin-bottom: 1.5rem; font-size: 0.95rem; }
+            .form-group { margin-bottom: 1rem; }
+            label { display: block; margin-bottom: 0.5rem; color: #333; font-weight: 500; font-size: 0.95rem; }
+            input { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 6px; font-size: 1rem; text-transform: uppercase; letter-spacing: 2px; text-align: center; font-family: monospace; }
+            button { width: 100%; padding: 0.85rem; background: #667eea; color: white; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
+            button:hover { background: #5568d3; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📺 Device Authorization</h1>
+            <p class="subtitle">Digite o código exibido no seu dispositivo</p>
+            <form method="GET" action="">
+                <input type="hidden" name="action" value="device">
+                <div class="form-group">
+                    <label for="user_code">Código do Usuário</label>
+                    <input type="text" id="user_code" name="user_code" placeholder="XXXX-XXXX" maxlength="9" required autofocus>
+                </div>
+                <button type="submit">Continuar</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+function showDeviceLoginForm($device_data, $error = '') {
+    global $clients;
+    $client_name = $clients[$device_data['client_id']]['client_name'] ?? $device_data['client_id'];
+    ?>
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Device Authorization - Login</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 1rem; }
+            .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 450px; }
+            h1 { color: #333; margin-bottom: 0.5rem; font-size: 1.8rem; text-align: center; }
+            .subtitle { color: #666; text-align: center; margin-bottom: 1.5rem; font-size: 0.95rem; }
+            .info { background: #e3f2fd; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; border-left: 4px solid #2196f3; font-size: 0.9rem; color: #1565c0; }
+            .error { background: #ffebee; color: #c62828; padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; border-left: 4px solid #c62828; font-size: 0.9rem; }
+            .form-group { margin-bottom: 1rem; }
+            label { display: block; margin-bottom: 0.5rem; color: #333; font-weight: 500; font-size: 0.95rem; }
+            input { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 6px; font-size: 1rem; }
+            button { width: 100%; padding: 0.85rem; background: #667eea; color: white; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
+            button:hover { background: #5568d3; }
+            .credentials { background: #f5f5f5; padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem; font-size: 0.85rem; }
+            .credentials code { background: white; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: monospace; color: #d32f2f; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔐 Login</h1>
+            <p class="subtitle">Device Flow - <?php echo htmlspecialchars($client_name); ?></p>
+            <div class="info">
+                <strong>Código:</strong> <?php echo htmlspecialchars($device_data['user_code']); ?><br>
+                <strong>Escopos:</strong> <?php echo htmlspecialchars($device_data['scope']); ?>
+            </div>
+            <?php if ($error): ?>
+                <div class="error"><?php echo htmlspecialchars($error); ?></div>
+            <?php endif; ?>
+            <div class="credentials">
+                <strong>Credenciais de Teste:</strong><br>
+                <code>usuario1</code> / <code>senha123</code> ou <code>usuario2</code> / <code>senha456</code>
+            </div>
+            <form method="POST" action="">
+                <input type="hidden" name="action" value="device">
+                <input type="hidden" name="user_code" value="<?php echo htmlspecialchars($device_data['user_code']); ?>">
+                <div class="form-group">
+                    <label for="username">Usuário</label>
+                    <input type="text" id="username" name="username" required autofocus>
+                </div>
+                <div class="form-group">
+                    <label for="password">Senha</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit">Entrar</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+function showDeviceConsentForm($device_data, $username) {
+    global $clients, $scopes_definition;
+    $client_name = $clients[$device_data['client_id']]['client_name'] ?? $device_data['client_id'];
+    $requested_scopes = parseScopes($device_data['scope']);
+    ?>
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Autorizar Dispositivo</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 1rem; }
+            .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 500px; }
+            h1 { color: #333; margin-bottom: 0.5rem; font-size: 1.6rem; text-align: center; }
+            .subtitle { color: #666; text-align: center; margin-bottom: 1.5rem; font-size: 0.95rem; }
+            .user-info { background: #f5f5f5; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem; }
+            .scope-list { background: #f5f5f5; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; }
+            .scope-item { padding: 0.5rem 0; border-bottom: 1px solid #ddd; }
+            .scope-item:last-child { border-bottom: none; }
+            .scope-name { font-weight: 600; color: #333; }
+            .scope-desc { font-size: 0.85rem; color: #666; }
+            .buttons { display: flex; gap: 1rem; }
+            button { flex: 1; padding: 0.75rem; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+            .allow { background: #667eea; color: white; }
+            .allow:hover { background: #5568d3; }
+            .deny { background: #f5f5f5; color: #333; border: 1px solid #ddd; }
+            .deny:hover { background: #eeeeee; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔐 Autorizar Dispositivo</h1>
+            <p class="subtitle"><?php echo htmlspecialchars($client_name); ?> solicita acesso</p>
+            <div class="user-info">
+                <strong>Usuário:</strong> <?php echo htmlspecialchars($username); ?><br>
+                <strong>Código:</strong> <?php echo htmlspecialchars($device_data['user_code']); ?>
+            </div>
+            <div class="scope-list">
+                <?php foreach ($requested_scopes as $scope_name): ?>
+                    <?php if (isset($scopes_definition[$scope_name])): ?>
+                        <div class="scope-item">
+                            <div class="scope-name"><?php echo htmlspecialchars($scope_name); ?></div>
+                            <div class="scope-desc"><?php echo htmlspecialchars($scopes_definition[$scope_name]['description']); ?></div>
+                        </div>
+                    <?php endif; ?>
+                <?php endforeach; ?>
+            </div>
+            <form method="POST" action="">
+                <input type="hidden" name="action" value="device">
+                <input type="hidden" name="user_code" value="<?php echo htmlspecialchars($device_data['user_code']); ?>">
+                <div class="buttons">
+                    <button type="submit" class="deny" name="consent" value="0">✕ Recusar</button>
+                    <button type="submit" class="allow" name="consent" value="1">✓ Autorizar</button>
+                </div>
+            </form>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+function showDeviceStatus($status) {
+    ?>
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Device Authorization</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 1rem; }
+            .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 450px; text-align: center; }
+            h1 { color: #333; margin-bottom: 1rem; font-size: 1.8rem; }
+            .icon { font-size: 4rem; margin-bottom: 1rem; }
+            .approved { color: #2e7d32; }
+            .denied { color: #c62828; }
+            p { color: #666; margin-bottom: 1rem; line-height: 1.6; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <?php if ($status === 'approved'): ?>
+                <div class="icon approved">✓</div>
+                <h1 class="approved">Autorizado!</h1>
+                <p>O dispositivo foi autorizado com sucesso.<br>Você pode fechar esta janela.</p>
+            <?php else: ?>
+                <div class="icon denied">✕</div>
+                <h1 class="denied">Acesso Negado</h1>
+                <p>O dispositivo não foi autorizado.<br>Você pode fechar esta janela.</p>
+            <?php endif; ?>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
 }
