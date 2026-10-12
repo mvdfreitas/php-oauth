@@ -157,12 +157,14 @@ function generateIdToken($username, $client_id, $nonce = null) {
         'alg' => 'HS256',
     ];
     
+    $now = time();
     $payload = [
         'iss' => $config['base_url'],
         'sub' => $username,
         'aud' => $client_id,
-        'exp' => time() + $config['access_token_expires'],
-        'iat' => time(),
+        'exp' => $now + $config['access_token_expires'],
+        'iat' => $now,
+        'auth_time' => $now,
     ];
     
     if ($nonce) {
@@ -190,6 +192,115 @@ function jsonResponse($data, $statusCode = 200) {
 function redirect($url) {
     header('Location: ' . $url);
     exit;
+}
+
+/**
+ * Devolve um erro OAuth2 ao cliente via redirect (com state), usando '#' quando
+ * a resposta usa fragment (implicit) e '?' no authorization code flow.
+ */
+function redirectWithError($redirect_uri, $error, $description, $state, $response_type = 'code') {
+    $params = ['error' => $error];
+    if ($description !== '') {
+        $params['error_description'] = $description;
+    }
+    if ($state !== null && $state !== '') {
+        $params['state'] = $state;
+    }
+
+    $is_fragment = in_array($response_type, ['token', 'id_token', 'id_token token'], true);
+    redirect($redirect_uri . ($is_fragment ? '#' : '?') . http_build_query($params));
+}
+
+/**
+ * Verifica um code_verifier contra o code_challenge armazenado (RFC 7636).
+ * Retorna true quando o código não usou PKCE.
+ */
+function verifyPkce($verifier, $challenge, $method) {
+    if ($challenge === null || $challenge === '') {
+        return true;
+    }
+
+    if ($verifier === null || $verifier === '') {
+        return false;
+    }
+
+    if ($method === 'plain') {
+        return hash_equals($challenge, $verifier);
+    }
+
+    $computed = base64UrlEncode(hash('sha256', $verifier, true));
+
+    return hash_equals($challenge, $computed);
+}
+
+function consentIsGranted($client_id, array $requested_scopes) {
+    $granted = $_SESSION['oauth_consent'][$client_id] ?? [];
+
+    return array_diff($requested_scopes, $granted) === [];
+}
+
+function grantConsent($client_id, array $scopes) {
+    $current = $_SESSION['oauth_consent'][$client_id] ?? [];
+    $_SESSION['oauth_consent'][$client_id] = array_values(array_unique(array_merge($current, $scopes)));
+}
+
+/**
+ * Emite a resposta final da autorização: tokens (implicit) ou authorization code.
+ */
+function completeAuthorization(array $authParams, $username) {
+    global $config;
+
+    $client_id = $authParams['client_id'];
+    $redirect_uri = $authParams['redirect_uri'];
+    $scope = $authParams['scope'];
+    $state = $authParams['state'];
+    $nonce = $authParams['nonce'];
+    $response_type = $authParams['response_type'];
+
+    $storage = loadStorage();
+
+    // Implicit Flow: tokens retornados diretamente no fragment (#), sem token exchange
+    if (in_array($response_type, ['token', 'id_token', 'id_token token'], true)) {
+        $response_params = ['state' => $state];
+
+        if ($response_type === 'token' || $response_type === 'id_token token') {
+            $response_params['access_token'] = createAccessToken($storage, $client_id, $username, $scope);
+            $response_params['token_type'] = 'Bearer';
+            $response_params['expires_in'] = $config['access_token_expires'];
+            $response_params['scope'] = $scope;
+        }
+
+        if ($response_type === 'id_token' || $response_type === 'id_token token') {
+            $response_params['id_token'] = generateIdToken($username, $client_id, $nonce);
+        }
+
+        saveStorage($storage);
+
+        redirect($redirect_uri . '#' . http_build_query($response_params));
+    }
+
+    // Authorization Code Flow: gerar code de uso único
+    $storage['auth_codes'] = $storage['auth_codes'] ?? [];
+
+    $code = generateCode();
+    $storage['auth_codes'][$code] = [
+        'client_id' => $client_id,
+        'username' => $username,
+        'scope' => $scope,
+        'redirect_uri' => $redirect_uri,
+        'nonce' => $nonce,
+        'response_type' => $response_type,
+        'code_challenge' => $authParams['code_challenge'] ?? null,
+        'code_challenge_method' => $authParams['code_challenge_method'] ?? null,
+        'created_at' => time(),
+        'expires_at' => time() + $config['code_expires'],
+    ];
+    saveStorage($storage);
+
+    redirect($redirect_uri . '?' . http_build_query([
+        'code' => $code,
+        'state' => $state,
+    ]));
 }
 
 function parseScopes($scope_string) {
@@ -253,7 +364,7 @@ function getAuthorizationHeader() {
 
 function handleAuthorize() {
     global $clients, $users, $scopes_definition;
-    
+
     // Parâmetros GET/POST
     $client_id = $_REQUEST['client_id'] ?? null;
     $redirect_uri = $_REQUEST['redirect_uri'] ?? null;
@@ -262,139 +373,134 @@ function handleAuthorize() {
     $state = $_REQUEST['state'] ?? '';
     $nonce = $_REQUEST['nonce'] ?? null;
     $prompt = $_REQUEST['prompt'] ?? null; // login, consent, none
-    $login_hint = $_REQUEST['login_hint'] ?? null; // email ou username
-    $id_token_hint = $_REQUEST['id_token_hint'] ?? null;
-    $display = $_REQUEST['display'] ?? 'page'; // page, popup, touch, wap
-    $ui_locales = $_REQUEST['ui_locales'] ?? null;
-    $acr_values = $_REQUEST['acr_values'] ?? null;
-    $max_age = $_REQUEST['max_age'] ?? null;
-    $claims = $_REQUEST['claims'] ?? null; // JSON com claims específicas
-    
-    // Validações iniciais
+    $login_hint = trim($_REQUEST['login_hint'] ?? '');
+    $code_challenge = $_REQUEST['code_challenge'] ?? null;
+    $code_challenge_method = $_REQUEST['code_challenge_method'] ?? null;
+
+    // Validações iniciais (sem redirect_uri validado ainda não é seguro redirecionar)
     if (!$client_id || !isset($clients[$client_id])) {
         return htmlResponse("Erro: client_id inválido", 400);
     }
-    
-    if (!$redirect_uri || !in_array($redirect_uri, $clients[$client_id]['redirect_uris'])) {
+
+    if (!$redirect_uri || !in_array($redirect_uri, $clients[$client_id]['redirect_uris'], true)) {
         return htmlResponse("Erro: redirect_uri inválido", 400);
     }
-    
+
+    // A partir daqui o redirect_uri é confiável: erros voltam ao cliente com o state
     $requested_scopes = parseScopes($scope);
     $client_allowed_scopes = array_keys($scopes_definition);
-    
+
     if (!validateScopes($requested_scopes, $client_allowed_scopes)) {
-        return htmlResponse("Erro: scope inválido", 400);
+        return redirectWithError($redirect_uri, 'invalid_scope', 'Scope inválido', $state, $response_type);
     }
-    
-    if (!in_array($response_type, $clients[$client_id]['response_types'])) {
-        return htmlResponse("Erro: response_type não permitido para este cliente", 400);
+
+    if (!in_array($response_type, $clients[$client_id]['response_types'], true)) {
+        return redirectWithError($redirect_uri, 'unsupported_response_type', 'response_type não permitido', $state, $response_type);
     }
-    
-    // Se POST (formulário de login)
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-        $username = trim($_POST['username'] ?? '');
-        $password = trim($_POST['password'] ?? '');
-        $consent = $_POST['consent'] ?? false;
-        
-        // Validar credenciais
-        if (!$username || !$password) {
-            return showLoginForm(
-                $client_id, $redirect_uri, $scope, $state, $nonce, 
-                $display, $ui_locales, 'Usuário e senha são obrigatórios', 
-                $login_hint, $response_type
-            );
-        }
-        
-        if (!isset($users[$username])) {
-            return showLoginForm(
-                $client_id, $redirect_uri, $scope, $state, $nonce,
-                $display, $ui_locales, 'Usuário não encontrado',
-                $login_hint, $response_type
-            );
-        }
-        
-        if ($users[$username]['password'] !== $password) {
-            return showLoginForm(
-                $client_id, $redirect_uri, $scope, $state, $nonce,
-                $display, $ui_locales, 'Senha incorreta',
-                $login_hint, $response_type
-            );
-        }
-        
-        // Se prompt=none, não pode mostrar formulário
-        if ($prompt === 'none') {
-            $error = 'interaction_required';
-            $callback_url = $redirect_uri . '?' . http_build_query([
-                'error' => $error,
-                'state' => $state,
-            ]);
-            redirect($callback_url);
-        }
-        
-        // Validar consentimento (se necessário)
-        if (!$consent && $prompt !== 'login') {
-            return showConsentForm(
-                $client_id, $redirect_uri, $scope, $state, $nonce, $username, 
-                $requested_scopes, $display, $response_type
-            );
-        }
-        
-        // Credenciais válidas!
-        $storage = loadStorage();
 
-        // Implicit Flow: tokens retornados diretamente no fragment (#), sem token exchange
-        if (in_array($response_type, ['token', 'id_token', 'id_token token'], true)) {
-            $response_params = ['state' => $state];
+    // PKCE (RFC 7636) - opcional, mas validado quando informado
+    if ($code_challenge !== null && $code_challenge !== '') {
+        $code_challenge_method = $code_challenge_method ?: 'plain';
+        if (!in_array($code_challenge_method, ['plain', 'S256'], true)) {
+            return redirectWithError($redirect_uri, 'invalid_request', 'code_challenge_method inválido', $state, $response_type);
+        }
+    } else {
+        $code_challenge = null;
+        $code_challenge_method = null;
+    }
 
-            if ($response_type === 'token' || $response_type === 'id_token token') {
-                $response_params['access_token'] = createAccessToken($storage, $client_id, $username, $scope);
-                $response_params['token_type'] = 'Bearer';
-                $response_params['expires_in'] = 3600;
-                $response_params['scope'] = $scope;
+    $authParams = [
+        'client_id' => $client_id,
+        'redirect_uri' => $redirect_uri,
+        'scope' => $scope,
+        'state' => $state,
+        'nonce' => $nonce,
+        'response_type' => $response_type,
+        'prompt' => $prompt,
+        'code_challenge' => $code_challenge,
+        'code_challenge_method' => $code_challenge_method,
+    ];
+
+    // ===================== Autenticação (separada do consentimento) =====================
+    $is_login_post = $_SERVER['REQUEST_METHOD'] === 'POST'
+        && isset($_POST['username'], $_POST['password'])
+        && trim((string) $_POST['password']) !== '';
+
+    if ($is_login_post) {
+        $username_input = trim((string) $_POST['username']);
+        $password = trim((string) $_POST['password']);
+
+        // Uma nova tentativa de login invalida qualquer autenticação anterior
+        unset($_SESSION['oauth_authenticated_user']);
+
+        if ($username_input === '' || $password === '') {
+            return showLoginForm($authParams, 'Usuário e senha são obrigatórios', $login_hint);
+        }
+        if (!isset($users[$username_input])) {
+            return showLoginForm($authParams, 'Usuário não encontrado', $login_hint);
+        }
+        if (!hash_equals($users[$username_input]['password'], $password)) {
+            return showLoginForm($authParams, 'Senha incorreta', $login_hint);
+        }
+
+        // Credenciais válidas: registra a autenticação na sessão
+        $_SESSION['oauth_authenticated_user'] = $username_input;
+        $username = $username_input;
+    } else {
+        $username = $_SESSION['oauth_authenticated_user'] ?? null;
+    }
+
+    // ===================== prompt=none (sem interação) =====================
+    if ($prompt === 'none') {
+        if ($username === null) {
+            return redirectWithError($redirect_uri, 'interaction_required', 'Autenticação necessária', $state, $response_type);
+        }
+        if (!consentIsGranted($client_id, $requested_scopes)) {
+            return redirectWithError($redirect_uri, 'consent_required', 'Consentimento necessário', $state, $response_type);
+        }
+
+        return completeAuthorization($authParams, $username);
+    }
+
+    // ===================== Consentimento =====================
+    $consent = $_POST['consent'] ?? null; // '1' autoriza, '0' recusa
+
+    if ($consent === '0') {
+        return redirectWithError($redirect_uri, 'access_denied', 'Usuário recusou o acesso', $state, $response_type);
+    }
+
+    if ($username === null) {
+        return showLoginForm($authParams, '', $login_hint);
+    }
+
+    $needs_consent = $consent !== '1'
+        && ($prompt === 'consent' || !consentIsGranted($client_id, $requested_scopes));
+
+    if ($needs_consent) {
+        return showConsentForm($authParams, $requested_scopes);
+    }
+
+    // Usuário autorizou: respeita os scopes efetivamente marcados
+    if ($consent === '1') {
+        $granted_scopes = $requested_scopes;
+        if (isset($_POST['scopes']) && is_array($_POST['scopes'])) {
+            $selected = array_values(array_intersect(array_map('strval', $_POST['scopes']), $requested_scopes));
+            if ($selected !== []) {
+                $granted_scopes = $selected;
             }
-
-            if ($response_type === 'id_token' || $response_type === 'id_token token') {
-                $response_params['id_token'] = generateIdToken($username, $client_id, $nonce);
-            }
-
-            saveStorage($storage);
-
-            redirect($redirect_uri . '#' . http_build_query($response_params));
         }
-
-        // Authorization Code Flow: gerar code de uso único
-        $storage['auth_codes'] = $storage['auth_codes'] ?? [];
-
-        $code = generateCode();
-        $storage['auth_codes'][$code] = [
-            'client_id' => $client_id,
-            'username' => $username,
-            'scope' => $scope,
-            'redirect_uri' => $redirect_uri,
-            'nonce' => $nonce,
-            'response_type' => $response_type,
-            'created_at' => time(),
-            'expires_at' => time() + 600,
-        ];
-        saveStorage($storage);
-
-        redirect($redirect_uri . '?' . http_build_query([
-            'code' => $code,
-            'state' => $state,
-        ]));
+        grantConsent($client_id, $granted_scopes);
+        $authParams['scope'] = implode(' ', $granted_scopes);
     }
-    
-    // GET - mostrar formulário
-    showLoginForm(
-        $client_id, $redirect_uri, $scope, $state, $nonce,
-        $display, $ui_locales, '', $login_hint, $response_type
-    );
+
+    completeAuthorization($authParams, $username);
 }
 
-function showLoginForm($client_id, $redirect_uri, $scope, $state, $nonce, $display, $ui_locales, $error = '', $login_hint = '', $response_type = 'code') {
+function showLoginForm(array $authParams, $error = '', $login_hint = '') {
     global $clients;
-    
-    $baseUrl = 'http://localhost:8000';
+
+    $client_id = $authParams['client_id'];
+    $scope = $authParams['scope'];
     $client_name = $clients[$client_id]['client_name'] ?? $client_id;
     ?>
     <!DOCTYPE html>
@@ -590,13 +696,11 @@ function showLoginForm($client_id, $redirect_uri, $scope, $state, $nonce, $displ
             </div>
             
             <form method="POST" action="">
-                <input type="hidden" name="client_id" value="<?php echo htmlspecialchars($client_id); ?>">
-                <input type="hidden" name="redirect_uri" value="<?php echo htmlspecialchars($redirect_uri); ?>">
-                <input type="hidden" name="scope" value="<?php echo htmlspecialchars($scope); ?>">
-                <input type="hidden" name="state" value="<?php echo htmlspecialchars($state); ?>">
-                <input type="hidden" name="nonce" value="<?php echo htmlspecialchars($nonce ?? ''); ?>">
-                <input type="hidden" name="response_type" value="<?php echo htmlspecialchars($response_type); ?>">
-                <input type="hidden" name="consent" value="1">
+                <?php foreach ($authParams as $param_name => $param_value): ?>
+                    <?php if ($param_value !== null && $param_value !== ''): ?>
+                        <input type="hidden" name="<?php echo htmlspecialchars($param_name); ?>" value="<?php echo htmlspecialchars((string) $param_value); ?>">
+                    <?php endif; ?>
+                <?php endforeach; ?>
                 
                 <div class="form-group">
                     <label for="username">👤 Usuário</label>
@@ -605,7 +709,7 @@ function showLoginForm($client_id, $redirect_uri, $scope, $state, $nonce, $displ
                         id="username" 
                         name="username" 
                         placeholder="usuario1"
-                        value="<?php echo htmlspecialchars($login_hint ?? ''); ?>"
+                        value="<?php echo htmlspecialchars($login_hint); ?>"
                         required 
                         autofocus
                     >
@@ -625,10 +729,11 @@ function showLoginForm($client_id, $redirect_uri, $scope, $state, $nonce, $displ
                 <button type="submit">✓ Entrar</button>
             </form>
             
-            <?php if ($nonce): ?>
+            <?php if ($authParams['nonce']): ?>
                 <div class="parameters">
                     <strong>Parâmetros:</strong><br>
-                    nonce: <?php echo htmlspecialchars($nonce); ?>
+                    nonce: <?php echo htmlspecialchars($authParams['nonce']); ?>
+                    <?php if ($authParams['code_challenge']): ?><br>PKCE: <?php echo htmlspecialchars($authParams['code_challenge_method']); ?><?php endif; ?>
                 </div>
             <?php endif; ?>
         </div>
@@ -638,9 +743,10 @@ function showLoginForm($client_id, $redirect_uri, $scope, $state, $nonce, $displ
     exit;
 }
 
-function showConsentForm($client_id, $redirect_uri, $scope, $state, $nonce, $username, $requested_scopes, $display, $response_type = 'code') {
+function showConsentForm(array $authParams, array $requested_scopes) {
     global $clients, $scopes_definition;
-    
+
+    $client_id = $authParams['client_id'];
     $client_name = $clients[$client_id]['client_name'] ?? $client_id;
     ?>
     <!DOCTYPE html>
@@ -749,14 +855,11 @@ function showConsentForm($client_id, $redirect_uri, $scope, $state, $nonce, $use
             <p class="subtitle"><?php echo htmlspecialchars($client_name); ?> está solicitando acesso</p>
             
             <form method="POST">
-                <input type="hidden" name="client_id" value="<?php echo htmlspecialchars($client_id); ?>">
-                <input type="hidden" name="redirect_uri" value="<?php echo htmlspecialchars($redirect_uri); ?>">
-                <input type="hidden" name="scope" value="<?php echo htmlspecialchars($scope); ?>">
-                <input type="hidden" name="state" value="<?php echo htmlspecialchars($state); ?>">
-                <input type="hidden" name="nonce" value="<?php echo htmlspecialchars($nonce ?? ''); ?>">
-                <input type="hidden" name="username" value="<?php echo htmlspecialchars($username); ?>">
-                <input type="hidden" name="password" value="">
-                <input type="hidden" name="response_type" value="<?php echo htmlspecialchars($response_type); ?>">
+                <?php foreach ($authParams as $param_name => $param_value): ?>
+                    <?php if ($param_value !== null && $param_value !== ''): ?>
+                        <input type="hidden" name="<?php echo htmlspecialchars($param_name); ?>" value="<?php echo htmlspecialchars((string) $param_value); ?>">
+                    <?php endif; ?>
+                <?php endforeach; ?>
                 
                 <div class="scope-list">
                     <?php foreach ($requested_scopes as $scope_name): ?>
@@ -781,7 +884,7 @@ function showConsentForm($client_id, $redirect_uri, $scope, $state, $nonce, $use
                 </div>
                 
                 <div class="buttons">
-                    <button type="button" class="deny" onclick="document.location='<?php echo htmlspecialchars($redirect_uri); ?>?error=access_denied&state=<?php echo urlencode($state); ?>'">
+                    <button type="submit" class="deny" name="consent" value="0">
                         ✕ Recusar
                     </button>
                     <button type="submit" class="allow" name="consent" value="1">
@@ -824,6 +927,7 @@ function handleToken() {
     $code = $_POST['code'] ?? null;
     $redirect_uri = $_POST['redirect_uri'] ?? null;
     $refresh_token = $_POST['refresh_token'] ?? null;
+    $code_verifier = $_POST['code_verifier'] ?? null;
     $username = $_POST['username'] ?? null;
     $password = $_POST['password'] ?? null;
     
@@ -859,7 +963,12 @@ function handleToken() {
         if ($auth_code['client_id'] !== $client_id || $auth_code['redirect_uri'] !== $redirect_uri) {
             return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Mismatch de client ou redirect_uri'], 400);
         }
-        
+
+        // PKCE (RFC 7636): se o code foi emitido com challenge, o verifier é obrigatório
+        if (!verifyPkce($code_verifier, $auth_code['code_challenge'] ?? null, $auth_code['code_challenge_method'] ?? null)) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Falha na verificação PKCE'], 400);
+        }
+
         $username = $auth_code['username'];
         $scope = $auth_code['scope'];
         $nonce = $auth_code['nonce'] ?? null;
@@ -881,9 +990,18 @@ function handleToken() {
         if ($stored_refresh['client_id'] !== $client_id) {
             return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Refresh token não pertence a este cliente'], 400);
         }
-        
+
+        if (isset($stored_refresh['expires_at']) && time() > $stored_refresh['expires_at']) {
+            unset($storage['refresh_tokens'][$refresh_token]);
+            saveStorage($storage);
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Refresh token expirado'], 400);
+        }
+
         $username = $stored_refresh['username'];
         $scope = $stored_refresh['scope'];
+
+        // Rotação: o refresh token usado é invalidado e um novo será emitido
+        unset($storage['refresh_tokens'][$refresh_token]);
     }
     // ======================== Resource Owner Password Credentials Flow ========================
     elseif ($grant_type === 'password') {
@@ -910,7 +1028,6 @@ function handleToken() {
     
     // Gerar tokens
     $access_token = generateToken();
-    $new_refresh_token = generateToken();
     
     $storage['access_tokens'] = $storage['access_tokens'] ?? [];
     $storage['access_tokens'][$access_token] = [
@@ -921,16 +1038,6 @@ function handleToken() {
         'expires_at' => time() + $config['access_token_expires'],
     ];
     
-    $storage['refresh_tokens'] = $storage['refresh_tokens'] ?? [];
-    $storage['refresh_tokens'][$new_refresh_token] = [
-        'client_id' => $client_id,
-        'username' => $username,
-        'scope' => $scope,
-        'created_at' => time(),
-    ];
-    
-    saveStorage($storage);
-    
     $response = [
         'access_token' => $access_token,
         'token_type' => 'Bearer',
@@ -938,10 +1045,23 @@ function handleToken() {
         'scope' => $scope,
     ];
     
-    // Adicionar refresh token
+    // Refresh token (não se aplica a client_credentials)
     if ($grant_type !== 'client_credentials') {
+        $new_refresh_token = generateToken();
+
+        $storage['refresh_tokens'] = $storage['refresh_tokens'] ?? [];
+        $storage['refresh_tokens'][$new_refresh_token] = [
+            'client_id' => $client_id,
+            'username' => $username,
+            'scope' => $scope,
+            'created_at' => time(),
+            'expires_at' => time() + $config['refresh_token_expires'],
+        ];
+
         $response['refresh_token'] = $new_refresh_token;
     }
+    
+    saveStorage($storage);
     
     // Adicionar id_token se openid scope
     if (in_array('openid', parseScopes($scope))) {
@@ -999,24 +1119,105 @@ function handleUserInfo() {
 }
 
 // ============================================================================
+// AÇÃO: REVOKE (RFC 7009 - Token Revocation)
+// ============================================================================
+
+function handleRevoke() {
+    global $clients;
+
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        return jsonResponse(['error' => 'invalid_request'], 405);
+    }
+
+    $client_id = $_POST['client_id'] ?? null;
+    $client_secret = $_POST['client_secret'] ?? null;
+
+    $auth_header = getAuthorizationHeader();
+    if ($auth_header && strpos($auth_header, 'Basic ') === 0) {
+        $credentials = base64_decode(substr($auth_header, 6));
+        if (strpos($credentials, ':') !== false) {
+            list($client_id, $client_secret) = explode(':', $credentials, 2);
+        }
+    }
+
+    if (!$client_id || !isset($clients[$client_id]) || $clients[$client_id]['client_secret'] !== $client_secret) {
+        return jsonResponse(['error' => 'invalid_client'], 401);
+    }
+
+    $token = $_POST['token'] ?? null;
+    $token_type_hint = $_POST['token_type_hint'] ?? null;
+
+    if (!$token) {
+        return jsonResponse(['error' => 'invalid_request', 'error_description' => 'token ausente'], 400);
+    }
+
+    $storage = loadStorage();
+
+    // Tenta primeiro o tipo sugerido e depois o outro (RFC 7009 §2.1)
+    $hints = ['access_token', 'refresh_token'];
+    if ($token_type_hint === 'refresh_token') {
+        $hints = ['refresh_token', 'access_token'];
+    }
+
+    $revoked = false;
+    foreach ($hints as $hint) {
+        $bucket = $hint === 'refresh_token' ? 'refresh_tokens' : 'access_tokens';
+
+        if (!isset($storage[$bucket][$token])) {
+            continue;
+        }
+
+        $token_data = $storage[$bucket][$token];
+
+        // Só revoga tokens do próprio cliente autenticado
+        if (($token_data['client_id'] ?? null) !== $client_id) {
+            continue;
+        }
+
+        unset($storage[$bucket][$token]);
+        $revoked = true;
+
+        // Revogar um refresh token também invalida os access tokens associados
+        if ($bucket === 'refresh_tokens') {
+            foreach ($storage['access_tokens'] ?? [] as $access_token => $data) {
+                if (($data['client_id'] ?? null) === $client_id
+                    && ($data['username'] ?? null) === ($token_data['username'] ?? null)) {
+                    unset($storage['access_tokens'][$access_token]);
+                }
+            }
+        }
+    }
+
+    saveStorage($storage);
+
+    // Conforme a RFC 7009, respondemos 200 mesmo se o token já era inválido
+    jsonResponse(['revoked' => $revoked]);
+}
+
+// ============================================================================
 // AÇÃO: WELL-KNOWN (OpenID Connect Discovery)
 // ============================================================================
 
 function handleWellKnown() {
     global $config;
-    
+
+    $base = $config['base_url'] . '/oauth2_complete.php';
+
     jsonResponse([
         'issuer' => $config['base_url'],
-        'authorization_endpoint' => $config['base_url'] . '/index.php?action=authorize',
-        'token_endpoint' => $config['base_url'] . '/index.php?action=token',
-        'userinfo_endpoint' => $config['base_url'] . '/index.php?action=userinfo',
+        'authorization_endpoint' => $base . '?action=authorize',
+        'token_endpoint' => $base . '?action=token',
+        'userinfo_endpoint' => $base . '?action=userinfo',
+        'revocation_endpoint' => $base . '?action=revoke',
         'response_types_supported' => ['code', 'token', 'id_token', 'id_token token', 'code token', 'code id_token', 'code id_token token'],
         'response_modes_supported' => ['query', 'fragment'],
         'grant_types_supported' => ['authorization_code', 'implicit', 'refresh_token', 'password', 'client_credentials'],
         'subject_types_supported' => ['public'],
-        'id_token_signing_alg_values_supported' => ['HS256', 'RS256'],
+        'id_token_signing_alg_values_supported' => ['HS256'],
         'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
         'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+        'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+        'code_challenge_methods_supported' => ['S256', 'plain'],
         'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
         'claim_types_supported' => ['normal'],
         'claims_supported' => ['sub', 'name', 'email', 'email_verified', 'phone_number', 'phone_number_verified', 'address', 'picture', 'locale'],
@@ -1353,6 +1554,9 @@ switch ($action) {
         break;
     case 'userinfo':
         handleUserInfo();
+        break;
+    case 'revoke':
+        handleRevoke();
         break;
     case 'well-known':
         handleWellKnown();

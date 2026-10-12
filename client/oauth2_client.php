@@ -135,6 +135,7 @@ if (isset($_GET['code'])) {
         $_SESSION['error'] = 'State mismatch - possível ataque CSRF! Fluxo abortado.';
         unset($_SESSION['oauth_state']);
         unset($_SESSION['oauth_nonce']);
+        unset($_SESSION['oauth_code_verifier']);
         header('Location: ' . $redirect_uri);
         exit;
     }
@@ -148,6 +149,7 @@ if (isset($_GET['code'])) {
         'grant_type' => 'authorization_code',
         'code' => $code,
         'redirect_uri' => $redirect_uri,
+        'code_verifier' => $_SESSION['oauth_code_verifier'] ?? '',
     ]);
 
     if ($token_response['status'] === 200 && isset($token_response['data']['access_token'])) {
@@ -183,6 +185,7 @@ if (isset($_GET['code'])) {
     // Limpar
     unset($_SESSION['oauth_state']);
     unset($_SESSION['oauth_nonce']);
+    unset($_SESSION['oauth_code_verifier']);
 
     header('Location: ' . $redirect_uri);
     exit;
@@ -362,6 +365,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['refresh_token'])) {
             $message = 'sucesso|Token renovado com sucesso!';
         } else {
             $message = 'erro|Erro ao renovar: ' . ($token_response['data']['error'] ?? 'desconhecido');
+        }
+    }
+}
+
+// Revogar Token (RFC 7009)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['revoke_token'])) {
+    $has_refresh = isset($_SESSION['token_data']['refresh_token']);
+    $token_to_revoke = $_SESSION['token_data']['refresh_token'] ?? $_SESSION['access_token'] ?? null;
+
+    if (!$token_to_revoke) {
+        $message = 'erro|Nenhum token para revogar';
+    } else {
+        $revoke_response = makeRequest('POST', $oauth_server . '/oauth2_complete.php?action=revoke', [
+            'client_id' => $client_id,
+            'client_secret' => $client_secret,
+            'token' => $token_to_revoke,
+            'token_type_hint' => $has_refresh ? 'refresh_token' : 'access_token',
+        ]);
+
+        if ($revoke_response['status'] === 200) {
+            unset(
+                $_SESSION['access_token'],
+                $_SESSION['token_data'],
+                $_SESSION['flow_used'],
+                $_SESSION['user_data'],
+                $_SESSION['id_token_claims'],
+                $_SESSION['id_token_error']
+            );
+            $message = 'sucesso|Token revogado com sucesso!';
+        } else {
+            $message = 'erro|Erro ao revogar: ' . ($revoke_response['data']['error'] ?? 'desconhecido');
         }
     }
 }
@@ -815,6 +849,15 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                         </p>
                     <?php endif; ?>
                     
+                    <form method="POST" style="margin-top: 1rem;">
+                        <button type="submit" name="revoke_token" value="1" class="danger" style="width: 100%;">
+                            🗑️ Revogar Token
+                        </button>
+                    </form>
+                    <p style="font-size: 0.85rem; color: #666; margin-top: 0.5rem;">
+                        Revoga o token no servidor (endpoint <code>revoke</code>)
+                    </p>
+                    
                     <hr style="margin: 1rem 0; border: none; border-top: 1px solid #ddd;">
                     
                     <form method="GET">
@@ -890,9 +933,13 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                                     <input type="checkbox" name="use_state" value="1" checked>
                                     Usar STATE (Proteção CSRF)
                                 </label><br>
-                                <label>
+                                <label style="margin-bottom: 0.5rem;">
                                     <input type="checkbox" name="ask_consent" value="1" checked>
                                     Pedir Consentimento
+                                </label><br>
+                                <label>
+                                    <input type="checkbox" name="prompt_none" value="1">
+                                    prompt=none (sem interação; exige consentimento prévio)
                                 </label>
                             </div>
                         </div>
@@ -907,23 +954,32 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     if (isset($_GET['auth_code'])) {
                         $state = generateRandomString();
                         $nonce = generateRandomString();
-                        
+
+                        // PKCE (RFC 7636): verifier aleatório e challenge S256
+                        $code_verifier = base64UrlEncode(random_bytes(32));
+                        $code_challenge = base64UrlEncode(hash('sha256', $code_verifier, true));
+
                         $_SESSION['oauth_state'] = $state;
                         $_SESSION['oauth_nonce'] = $nonce;
-                        
+                        $_SESSION['oauth_code_verifier'] = $code_verifier;
+
                         $params = [
                             'client_id' => $client_id,
                             'redirect_uri' => $redirect_uri,
                             'response_type' => 'code',
                             'scope' => 'openid profile email phone address',
                             'state' => $state,
+                            'code_challenge' => $code_challenge,
+                            'code_challenge_method' => 'S256',
                         ];
                         
                         if ($_GET['use_nonce'] ?? false) {
                             $params['nonce'] = $nonce;
                         }
-                        
-                        if ($_GET['ask_consent'] ?? false) {
+
+                        if ($_GET['prompt_none'] ?? false) {
+                            $params['prompt'] = 'none';
+                        } elseif ($_GET['ask_consent'] ?? false) {
                             $params['prompt'] = 'consent';
                         }
                         
