@@ -899,6 +899,10 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     🔧 Client Flow<br>
                     <small>Backend</small>
                 </a>
+                <a href="?flow=device" class="flow-button <?php echo $flow_type === 'device' ? 'active' : ''; ?>">
+                    📺 Device Flow<br>
+                    <small>CLI / TV</small>
+                </a>
             </div>
             
             <!-- AUTHORIZATION CODE FLOW -->
@@ -1098,6 +1102,148 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                         </button>
                     </form>
                 </div>
+            <?php endif; ?>
+
+            <!-- DEVICE FLOW -->
+            <?php if ($flow_type === 'device'): ?>
+                <div class="card">
+                    <h2>📺 Device Authorization Grant (RFC 8628)</h2>
+                    
+                    <div class="info-box">
+                        <strong>Como funciona:</strong>
+                        <ol style="margin-left: 1.5rem; margin-top: 0.5rem;">
+                            <li>O dispositivo solicita um código (device_code + user_code)</li>
+                            <li>Exibe instruções para o usuário acessar no navegador</li>
+                            <li>Usuário autentica e autoriza no navegador</li>
+                            <li>Dispositivo faz polling até receber o token</li>
+                        </ol>
+                    </div>
+                    
+                    <div id="device-step1">
+                        <button type="button" onclick="startDeviceFlow()" style="width: 100%;">
+                            🚀 Iniciar Device Flow
+                        </button>
+                    </div>
+                    
+                    <div id="device-step2" style="display: none;">
+                        <h3>Passo 1: Acesse e digite o código</h3>
+                        <div style="background: #f0f4ff; padding: 1.5rem; border-radius: 8px; margin: 1rem 0; text-align: center; border: 2px dashed #667eea;">
+                            <div style="font-size: 0.9rem; color: #666; margin-bottom: 0.5rem;">Acesse este URL no seu navegador:</div>
+                            <div id="verification-uri" style="font-size: 0.85rem; color: #667eea; word-break: break-all; margin-bottom: 1rem; font-family: monospace; background: white; padding: 0.5rem; border-radius: 4px;"></div>
+                            <div style="font-size: 0.9rem; color: #666; margin-bottom: 0.5rem;">Ou use o código completo:</div>
+                            <div id="verification-uri-complete" style="font-size: 0.85rem; color: #667eea; word-break: break-all; margin-bottom: 1rem; font-family: monospace; background: white; padding: 0.5rem; border-radius: 4px;"></div>
+                            <div style="font-size: 1.2rem; color: #333; margin-top: 1rem;">Código do Usuário:</div>
+                            <div id="user-code" style="font-size: 2rem; font-weight: bold; letter-spacing: 4px; color: #667eea; margin: 0.5rem 0; font-family: monospace; background: white; padding: 1rem; border-radius: 8px; border: 2px solid #667eea;"></div>
+                        </div>
+                        
+                        <h3>Passo 2: Aguardando autorização...</h3>
+                        <div style="background: #f5f5f5; padding: 1rem; border-radius: 8px; margin: 1rem 0; text-align: center;">
+                            <div id="polling-status" style="color: #666; margin-bottom: 0.5rem;">Fazendo polling a cada <span id="interval">5</span> segundos...</div>
+                            <div style="font-size: 0.85rem; color: #999;">Status: <span id="auth-status">authorization_pending</span></div>
+                        </div>
+                        
+                        <div id="device-success" style="display: none; background: #d4edda; color: #155724; padding: 1rem; border-radius: 8px; margin: 1rem 0; text-align: center; border-left: 4px solid #28a745;">
+                            ✓ Autorizado com sucesso! Redirecionando...
+                        </div>
+                        
+                        <div id="device-error" style="display: none; background: #f8d7da; color: #721c24; padding: 1rem; border-radius: 8px; margin: 1rem 0; border-left: 4px solid #f5c6cb;"></div>
+                    </div>
+                </div>
+                
+                <script>
+                let deviceCode = null;
+                let interval = 5;
+                let pollingTimer = null;
+                
+                function startDeviceFlow() {
+                    document.getElementById('device-step1').style.display = 'none';
+                    document.getElementById('device-step2').style.display = 'block';
+                    
+                    fetch('<?php echo $oauth_server; ?>/oauth2_complete.php?action=device_code', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: 'client_id=<?php echo urlencode($client_id); ?>&scope=openid%20profile%20email'
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.error) {
+                            showDeviceError(data.error_description || data.error);
+                            return;
+                        }
+                        deviceCode = data.device_code;
+                        interval = data.interval || 5;
+                        document.getElementById('verification-uri').textContent = data.verification_uri;
+                        document.getElementById('verification-uri-complete').textContent = data.verification_uri_complete;
+                        document.getElementById('user-code').textContent = data.user_code;
+                        document.getElementById('interval').textContent = interval;
+                        startPolling();
+                    })
+                    .catch(err => {
+                        showDeviceError('Erro ao iniciar Device Flow: ' + err);
+                    });
+                }
+                
+                function startPolling() {
+                    if (pollingTimer) clearInterval(pollingTimer);
+                    pollingTimer = setInterval(poll, interval * 1000);
+                    poll();
+                }
+                
+                function poll() {
+                    if (!deviceCode) return;
+                    
+                    const formData = new URLSearchParams();
+                    formData.append('client_id', '<?php echo $client_id; ?>');
+                    formData.append('client_secret', '<?php echo $client_secret; ?>');
+                    formData.append('grant_type', 'urn:ietf:params:oauth:grant-type:device_code');
+                    formData.append('device_code', deviceCode);
+                    
+                    fetch('<?php echo $oauth_server; ?>/oauth2_complete.php?action=token', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: formData
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.access_token) {
+                            clearInterval(pollingTimer);
+                            document.getElementById('device-success').style.display = 'block';
+                            document.getElementById('polling-status').style.display = 'none';
+                            setTimeout(() => {
+                                window.location.href = '<?php echo $redirect_uri; ?>';
+                            }, 1000);
+                        } else if (data.error === 'authorization_pending') {
+                            document.getElementById('auth-status').textContent = 'authorization_pending';
+                        } else if (data.error === 'slow_down') {
+                            interval += 5;
+                            document.getElementById('interval').textContent = interval;
+                            document.getElementById('auth-status').textContent = 'slow_down (intervalo aumentado)';
+                            startPolling();
+                        } else if (data.error === 'expired_token') {
+                            clearInterval(pollingTimer);
+                            showDeviceError('Código expirado. Reinicie o Device Flow.');
+                        } else if (data.error === 'access_denied') {
+                            clearInterval(pollingTimer);
+                            showDeviceError('Acesso negado pelo usuário.');
+                        } else {
+                            document.getElementById('auth-status').textContent = data.error || 'erro';
+                        }
+                    })
+                    .catch(err => {
+                        console.error('Polling error:', err);
+                    });
+                }
+                
+                function showDeviceError(msg) {
+                    const el = document.getElementById('device-error');
+                    el.textContent = msg;
+                    el.style.display = 'block';
+                }
+                </script>
             <?php endif; ?>
             
             <!-- INFORMAÇÕES E CREDENCIAIS -->

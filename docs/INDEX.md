@@ -55,6 +55,8 @@ php-oauth/
 | `docs/QUICKSTART.md` | Começar muito rápido |
 | `docs/PLAN_AUTHORIZATION_CODE_FLOW.md` | 📋 Plano: Authorization Code Flow + melhorias de segurança |
 | `docs/PLAN_IMPLICIT_FLOW.md` | 📋 Plano: Implicit Flow + melhorias de segurança |
+| `docs/PLAN_DEVICE_AUTHORIZATION_GRANT.md` | 📋 Plano: Device Authorization Grant (RFC 8628 - Device Flow) |
+| `docs/ANALISE_METODOS_AUTENTICACAO.md` | 📊 Análise: Métodos de Autenticação OAuth 2.0/2.1 e Mercado |
 | `README.md` | Overview geral |
 | `docs/INDEX.md` | Este arquivo |
 
