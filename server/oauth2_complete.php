@@ -1284,19 +1284,18 @@ function handleWellKnown() {
         'revocation_endpoint' => $base . '?action=revoke',
         'response_types_supported' => ['code', 'token', 'id_token', 'id_token token', 'code token', 'code id_token', 'code id_token token'],
         'response_modes_supported' => ['query', 'fragment'],
-    'grant_types_supported' => ['authorization_code', 'implicit', 'refresh_token', 'password', 'client_credentials', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code'],
-    'subject_types_supported' => ['public'],
-    'id_token_signing_alg_values_supported' => ['HS256'],
-    'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
-    'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
-    'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
-    'code_challenge_methods_supported' => ['S256', 'plain'],
-    'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
-    'claim_types_supported' => ['normal'],
-    'claims_supported' => ['sub', 'name', 'email', 'email_verified', 'phone_number', 'phone_number_verified', 'address', 'picture', 'locale'],
-    'claim_parameter_supported' => true,
-    'device_authorization_endpoint' => $base . '?action=device_code',
-]);
+        'grant_types_supported' => ['authorization_code', 'implicit', 'refresh_token', 'password', 'client_credentials'],
+        'subject_types_supported' => ['public'],
+        'id_token_signing_alg_values_supported' => ['HS256'],
+        'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
+        'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+        'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+        'code_challenge_methods_supported' => ['S256', 'plain'],
+        'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
+        'claim_types_supported' => ['normal'],
+        'claims_supported' => ['sub', 'name', 'email', 'email_verified', 'phone_number', 'phone_number_verified', 'address', 'picture', 'locale'],
+        'claim_parameter_supported' => true,
+    ]);
 }
 
 // ============================================================================
