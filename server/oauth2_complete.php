@@ -79,6 +79,20 @@ $clients = [
         'grant_types' => [],          // não obtém tokens, apenas introspecta
         'token_endpoint_auth_method' => 'client_secret_basic',
     ],
+    // Cliente público (PKCE sem secret) — OAuth 2.1 / RFC 9700
+    'spa_publica' => [
+        'client_id' => 'spa_publica',
+        'client_secret' => null,      // cliente público não possui segredo
+        'public' => true,
+        'client_name' => 'SPA Pública (React/Angular)',
+        'redirect_uris' => [
+            'http://localhost:3000/callback',
+            'http://localhost:8001/oauth2_client.php',
+        ],
+        'response_types' => ['code'],
+        'grant_types' => ['authorization_code', 'refresh_token'],
+        'token_endpoint_auth_method' => 'none',
+    ],
 ];
 
 // Escopos disponíveis e suas claims
@@ -235,6 +249,26 @@ function redirectWithError($redirect_uri, $error, $description, $state, $respons
 
     $is_fragment = in_array($response_type, ['token', 'id_token', 'id_token token'], true);
     redirect($redirect_uri . ($is_fragment ? '#' : '?') . http_build_query($params));
+}
+
+/**
+ * Indica se o cliente é público (sem client_secret) — OAuth 2.1 / RFC 9700.
+ * Um cliente é público quando marcado com 'public' => true ou com 'client_secret' => null.
+ */
+function isPublicClient($client_id) {
+    global $clients;
+
+    if (!isset($clients[$client_id])) {
+        return false;
+    }
+
+    $client = $clients[$client_id];
+
+    if (!empty($client['public'])) {
+        return true;
+    }
+
+    return ($client['client_secret'] ?? null) === null;
 }
 
 /**
@@ -424,13 +458,18 @@ function handleAuthorize() {
         return redirectWithError($redirect_uri, 'unsupported_response_type', 'response_type não permitido', $state, $response_type);
     }
 
-    // PKCE (RFC 7636) - opcional, mas validado quando informado
+    // PKCE (RFC 7636) - obrigatório para clientes públicos (OAuth 2.1 / RFC 9700);
+    // opcional para clientes confidenciais, mas validado quando informado
     if ($code_challenge !== null && $code_challenge !== '') {
         $code_challenge_method = $code_challenge_method ?: 'plain';
         if (!in_array($code_challenge_method, ['plain', 'S256'], true)) {
             return redirectWithError($redirect_uri, 'invalid_request', 'code_challenge_method inválido', $state, $response_type);
         }
     } else {
+        // Cliente público exige code_challenge (PKCE obrigatório)
+        if (isPublicClient($client_id)) {
+            return redirectWithError($redirect_uri, 'invalid_request', 'code_challenge é obrigatório para clientes públicos', $state, $response_type);
+        }
         $code_challenge = null;
         $code_challenge_method = null;
     }
@@ -961,8 +1000,10 @@ function handleToken() {
     if (!$client_id || !isset($clients[$client_id])) {
         return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client ID inválido'], 400);
     }
-    
-    if ($clients[$client_id]['client_secret'] !== $client_secret) {
+
+    // Clientes públicos (PKCE sem secret) não possuem client_secret — a
+    // autenticação é feita apenas pelo client_id (RFC 9700).
+    if (!isPublicClient($client_id) && $clients[$client_id]['client_secret'] !== $client_secret) {
         return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client secret inválido'], 401);
     }
     
@@ -1222,7 +1263,8 @@ function handleRevoke() {
         }
     }
 
-    if (!$client_id || !isset($clients[$client_id]) || $clients[$client_id]['client_secret'] !== $client_secret) {
+    if (!$client_id || !isset($clients[$client_id])
+        || (!isPublicClient($client_id) && $clients[$client_id]['client_secret'] !== $client_secret)) {
         return jsonResponse(['error' => 'invalid_client'], 401);
     }
 
@@ -1304,7 +1346,8 @@ function handleIntrospect() {
     }
 
     if (!$client_id || !isset($clients[$client_id])
-        || !hash_equals((string) $clients[$client_id]['client_secret'], (string) $client_secret)) {
+        || (!isPublicClient($client_id)
+            && !hash_equals((string) $clients[$client_id]['client_secret'], (string) $client_secret))) {
         header('WWW-Authenticate: Basic realm="oauth2"');
         return jsonResponse(['error' => 'invalid_client'], 401);
     }
@@ -1379,9 +1422,9 @@ function handleWellKnown() {
         'subject_types_supported' => ['public'],
         'id_token_signing_alg_values_supported' => ['HS256'],
         'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
-        'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
-        'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
-        'introspection_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+        'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post', 'none'],
+        'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post', 'none'],
+        'introspection_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post', 'none'],
         'code_challenge_methods_supported' => ['S256', 'plain'],
         'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
         'claim_types_supported' => ['normal'],
