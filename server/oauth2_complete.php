@@ -70,6 +70,15 @@ $clients = [
     'logo_uri' => 'https://via.placeholder.com/200',
     'contacts' => ['admin@example.com'],
 ],
+    'api_recursos' => [
+        'client_id' => 'api_recursos',
+        'client_secret' => 'segredo_api_456',
+        'client_name' => 'API de Recursos (Resource Server)',
+        'redirect_uris' => [],
+        'response_types' => [],
+        'grant_types' => [],          // não obtém tokens, apenas introspecta
+        'token_endpoint_auth_method' => 'client_secret_basic',
+    ],
 ];
 
 // Escopos disponíveis e suas claims
@@ -1268,6 +1277,87 @@ function handleRevoke() {
 }
 
 // ============================================================================
+// AÇÃO: INTROSPECT (RFC 7662 - Token Introspection)
+// ============================================================================
+
+function handleIntrospect() {
+    global $clients, $config;
+
+    // RFC 7662 §4: respostas de introspecção não devem ser cacheadas
+    header('Cache-Control: no-store');
+    header('Pragma: no-cache');
+
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        return jsonResponse(['error' => 'invalid_request'], 405);
+    }
+
+    // Autenticação do Resource Server (client_secret_post ou client_secret_basic)
+    $client_id = $_POST['client_id'] ?? null;
+    $client_secret = $_POST['client_secret'] ?? null;
+
+    $auth_header = getAuthorizationHeader();
+    if ($auth_header && strpos($auth_header, 'Basic ') === 0) {
+        $credentials = base64_decode(substr($auth_header, 6));
+        if (strpos($credentials, ':') !== false) {
+            list($client_id, $client_secret) = explode(':', $credentials, 2);
+        }
+    }
+
+    if (!$client_id || !isset($clients[$client_id])
+        || !hash_equals((string) $clients[$client_id]['client_secret'], (string) $client_secret)) {
+        header('WWW-Authenticate: Basic realm="oauth2"');
+        return jsonResponse(['error' => 'invalid_client'], 401);
+    }
+
+    $token = $_POST['token'] ?? null;
+    if (!$token) {
+        return jsonResponse(['error' => 'invalid_request', 'error_description' => 'token ausente'], 400);
+    }
+
+    // O hint só define a ordem da busca; se não achar, procura no outro tipo (RFC 7662 §2.1)
+    $buckets = ['access_tokens', 'refresh_tokens'];
+    if (($_POST['token_type_hint'] ?? null) === 'refresh_token') {
+        $buckets = ['refresh_tokens', 'access_tokens'];
+    }
+
+    $storage = loadStorage();
+
+    foreach ($buckets as $bucket) {
+        if (!isset($storage[$bucket][$token])) {
+            continue;
+        }
+
+        $data = $storage[$bucket][$token];
+
+        // Expirado → inativo (somente leitura: não remove do storage)
+        if (time() > ($data['expires_at'] ?? 0)) {
+            return jsonResponse(['active' => false]);
+        }
+
+        $response = [
+            'active'     => true,
+            'scope'      => $data['scope'],
+            'client_id'  => $data['client_id'],
+            'sub'        => $data['username'],
+            'token_type' => $bucket === 'refresh_tokens' ? 'refresh_token' : 'Bearer',
+            'exp'        => $data['expires_at'],
+            'iat'        => $data['created_at'],
+            'iss'        => $config['base_url'],
+        ];
+
+        // Client Credentials grava username = client_id; nesse caso não há usuário final
+        if ($data['username'] !== $data['client_id']) {
+            $response['username'] = $data['username'];
+        }
+
+        return jsonResponse($response);
+    }
+
+    // Token desconhecido ou revogado
+    return jsonResponse(['active' => false]);
+}
+
+// ============================================================================
 // AÇÃO: WELL-KNOWN (OpenID Connect Discovery)
 // ============================================================================
 
@@ -1282,6 +1372,7 @@ function handleWellKnown() {
         'token_endpoint' => $base . '?action=token',
         'userinfo_endpoint' => $base . '?action=userinfo',
         'revocation_endpoint' => $base . '?action=revoke',
+        'introspection_endpoint' => $base . '?action=introspect',
         'response_types_supported' => ['code', 'token', 'id_token', 'id_token token', 'code token', 'code id_token', 'code id_token token'],
         'response_modes_supported' => ['query', 'fragment'],
         'grant_types_supported' => ['authorization_code', 'implicit', 'refresh_token', 'password', 'client_credentials'],
@@ -1290,6 +1381,7 @@ function handleWellKnown() {
         'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
         'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
         'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
+        'introspection_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
         'code_challenge_methods_supported' => ['S256', 'plain'],
         'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
         'claim_types_supported' => ['normal'],
@@ -1535,6 +1627,13 @@ function handleDebug() {
                     <strong>POST /token (com Basic Auth)</strong>
                     <code>grant_type=client_credentials&scope=openid%20profile</code>
                     <p style="margin-top: 0.5rem; font-size: 0.8rem; color: #666;">Header: Authorization: Basic base64(cliente_teste:senha_secreta_123)</p>
+                </div>
+
+                <h3 style="color: #333; margin-top: 1.5rem; margin-bottom: 0.5rem;">Token Introspection (RFC 7662):</h3>
+                <div class="endpoint">
+                    <strong>POST /introspect (com Basic Auth do Resource Server)</strong>
+                    <code>token=ACCESS_TOKEN&amp;token_type_hint=access_token</code>
+                    <p style="margin-top: 0.5rem; font-size: 0.8rem; color: #666;">Header: Authorization: Basic base64(api_recursos:segredo_api_456)</p>
                 </div>
             </div>
             
@@ -1800,6 +1899,9 @@ switch ($action) {
         break;
     case 'revoke':
         handleRevoke();
+        break;
+    case 'introspect':
+        handleIntrospect();
         break;
     case 'well-known':
         handleWellKnown();
