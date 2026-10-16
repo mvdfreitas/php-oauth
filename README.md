@@ -316,38 +316,7 @@ const userinfo = await fetch('http://localhost:8000/oauth2_server.php?action=use
 const user = await userinfo.json();
 ```
 
-### Python:
-```python
-import requests
-from urllib.parse import urlencode
 
-# 1. Redirecionar para authorize
-client_id = 'cliente_teste'
-redirect_uri = 'http://localhost:8001/callback'
-auth_url = f"http://localhost:8000/oauth2_server.php?action=authorize&client_id={client_id}&redirect_uri={redirect_uri}&response_type=code&scope=openid profile"
-
-# 2. Trocar code por token
-code = "seu_code_aqui"
-token_response = requests.post(
-    'http://localhost:8000/oauth2_server.php?action=token',
-    data={
-        'client_id': 'cliente_teste',
-        'client_secret': 'senha_secreta_123',
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': 'http://localhost:8001/callback'
-    }
-)
-token = token_response.json()
-
-# 3. Usar token para obter dados
-userinfo_response = requests.get(
-    'http://localhost:8000/oauth2_server.php?action=userinfo',
-    headers={'Authorization': f"Bearer {token['access_token']}"}
-)
-user = userinfo_response.json()
-print(user)
-```
 
 ## 📞 Suporte
 
