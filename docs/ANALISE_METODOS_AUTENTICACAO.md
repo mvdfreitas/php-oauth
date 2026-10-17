@@ -25,7 +25,7 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 | **Token Introspection** | RFC 7662 | ✅ Sim | 🔥 **PADRÃO DA INDÚSTRIA** | Essencial para APIs/Resource Servers com tokens opacos |
 | **Public Clients (PKCE sem secret)** | OAuth 2.1 / RFC 7636 | ✅ Sim | 🔥 **PADRÃO OBRIGATÓRIO** | SPAs e Apps Mobile não devem ter `client_secret` |
 | **JWT Bearer Assertion** | RFC 7523 | ✅ Sim | 💼 **MUITO UTILIZADO (Enterprise)** | Padrão de Service Accounts (Google Cloud, Salesforce) |
-| **Token Exchange** | RFC 8693 | ❌ **Falta** | 🏢 **MÉDIO/ENTERPRISE** | Usado em malhas de microsserviços / delegação |
+| **Token Exchange** | RFC 8693 | ✅ Sim | 🏢 **MÉDIO/ENTERPRISE** | Usado em malhas de microsserviços / delegação |
 | **OIDC Hybrid Flow** | OIDC Core 1.0 | ❌ **Falta** | ⏳ **EM DECLÍNIO** | Pouco usado em novos projetos; superado por Code + PKCE |
 | **SAML 2.0 Assertion** | RFC 7522 | ❌ **Falta** | 🏛️ **LEGADO CORPORATIVO** | Apenas para migração de SSO corporativo legado |
 | **MFA / TOTP no Login** | RFC 6238 | ❌ **Falta** | 🔥 **PADRÃO UNIVERSAL** | Autenticação do usuário final com segundo fator |
@@ -35,21 +35,17 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 ## 2. Análise Detalhada dos Métodos Faltantes no Mercado
 
 > [!NOTE]
-> Device Authorization Grant (RFC 8628), Token Introspection (RFC 7662), Public Clients (OAuth 2.1) e JWT Bearer Assertion (RFC 7523) **já foram implementados** e foram movidos para a seção 3.
+> Device Authorization Grant (RFC 8628), Token Introspection (RFC 7662), Public Clients (OAuth 2.1), JWT Bearer Assertion (RFC 7523) e Token Exchange (RFC 8693) **já foram implementados** e foram movidos para a seção 3.
 
-### 2.1 Token Exchange (RFC 8693)
-* **O que é:** Permite a um serviço trocar um *access token* recebido por outro token com escopo/audiência diferentes, mantendo a identidade original (`subject`) ou atuando em nome de outro (*delegation*).
-* **Ainda é utilizado no mercado?** **SIM, EM AMBIENTES ENTERPRISE / MICROSSERVIÇOS** (Kubernetes with SPIFFE/SPIRE, AWS, Google Cloud, Keycloak). Não é urgente para um projeto didático.
-
-### 2.2 MFA / TOTP no Login (RFC 6238)
+### 2.1 MFA / TOTP no Login (RFC 6238)
 * **O que é:** Segundo fator (código de 6 dígitos rotativo) exigido no momento da autenticação do usuário, antes da emissão do authorization code ou do token.
 * **Ainda é utilizado no mercado?** **SIM, PADRÃO UNIVERSAL** — exigido por Google, GitHub, Microsoft e pela maioria das normas de segurança (NIST 800-63B).
 
-### 2.3 OIDC Hybrid Flow (OIDC Core 1.0)
+### 2.2 OIDC Hybrid Flow (OIDC Core 1.0)
 * **O que é:** Variante que retorna code e/ou tokens na primeira chamada de `/authorize` (fragmento ou query).
 * **Ainda é utilizado no mercado?** **EM DECLÍNIO** — superado por Authorization Code + PKCE; mantido apenas por compatibilidade.
 
-### 2.4 SAML 2.0 Assertion (RFC 7522)
+### 2.3 SAML 2.0 Assertion (RFC 7522)
 * **O que é:** Permite autenticação de clientes mediante uma assertion SAML assinada, no lugar de `client_secret`.
 * **Ainda é utilizado no mercado?** **LEGADO CORPORATIVO** — apenas para migração de SSO corporativo antigo.
 
@@ -72,8 +68,9 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 | **Token Introspection** ✅ *novo* | `?action=introspect` (RFC 7662) | `docs/TOKEN_INTROSPECTION.md` |
 | **Public Clients (PKCE sem secret)** ✅ *novo* | `isPublicClient()` + cliente `spa_publica`; PKCE obrigatório no `/authorize`, `client_secret` dispensado no `/token` | `docs/IMPLEMENTACAO_PUBLIC_CLIENTS.md` |
 | **JWT Bearer Assertion** ✅ *novo* | `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` + `client_assertion` (RFC 7523) | `docs/PLAN_JWT_BEARER_ASSERTION.md` |
+| **Token Exchange** ✅ *novo* | `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` (`subject_token`/`actor_token`, RFC 8693) | `docs/PLAN_TOKEN_EXCHANGE.md` |
 
-O cliente (`client/oauth2_client.php`) possui abas interativas para Authorization Code, Implicit, Password, Client Credentials, **Device Flow** e **JWT Bearer**.
+O cliente (`client/oauth2_client.php`) possui abas interativas para Authorization Code, Implicit, Password, Client Credentials, **Device Flow**, **JWT Bearer** e **Token Exchange**.
 
 > [!WARNING]
 > ### Alerta sobre Métodos Obsoletos Já Presentes no Código
@@ -96,11 +93,11 @@ flowchart TD
 
     subgraph Fase2["Fase 2: Métodos Enterprise / Avançados"]
         D["JWT Bearer Assertion (RFC 7523) ✅"]
+        D2["Token Exchange (RFC 8693) ✅"]
         E["MFA / TOTP na Autenticação do Usuário"]
     end
 
     subgraph Fase3["Fase 3: Opcional / Específico"]
-        F["Token Exchange (RFC 8693)"]
         G["OIDC Hybrid Flow / SAML 2.0 (legado)"]
     end
 
@@ -191,7 +188,54 @@ Resposta inativa ou expirada:
 
 ---
 
-### 5.5 Componente Pendente B: MFA / TOTP no Login (RFC 6238)
+### 5.5 Componente Concluído: Token Exchange (RFC 8693) ✅
+
+> Implementado em `server/oauth2_complete.php`: helpers `findOpaqueToken()` (busca o token opaco em `access_tokens`/`refresh_tokens`, respeitando a expiração) e `isScopeSubset()`; grant `urn:ietf:params:oauth:grant-type:token-exchange` em `handleToken()` (valida `subject_token`/`subject_token_type`, dono do token, `actor_token` para delegação, subset de `scope` e `audience` contra `allowed_audiences`); `issued_token_type` na resposta; `act`/`aud` expostos no `?action=introspect`; grant anunciado no `?action=well-known` e aba "🔄 Token Exchange" no cliente. Detalhes em `docs/PLAN_TOKEN_EXCHANGE.md`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Cliente (microsserviço)
+    participant S as Servidor OAuth2 (8000)
+
+    C->>S: POST ?action=token (Basic Auth)
+       grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+       subject_token=<AT do usuário>
+       actor_token=<AT do serviço> (opcional, delegação)
+       scope=openid (opcional, subset)
+       audience=http://localhost:8000/api (opcional)
+    S->>S: Valida subject_token/actor_token (ativos, mesmo client_id)
+    S->>S: Valida subset de escopo e audiência permitida
+    S-->>C: 200 {access_token, issued_token_type, token_type, expires_in, scope}
+    Note over S: O subject_token NÃO é revogado (troca não destrutiva)
+```
+
+Requisição:
+```bash
+POST /oauth2_complete.php?action=token
+Authorization: Basic <client_id:client_secret>
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+&subject_token=<access_token>
+&subject_token_type=urn:ietf:params:oauth:token-type:access_token
+&scope=openid
+```
+
+Resposta:
+```json
+{
+  "access_token": "9f3c...",
+  "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "scope": "openid"
+}
+```
+
+---
+
+### 5.6 Componente Pendente: MFA / TOTP no Login (RFC 6238)
 
 * Gerar segredo TOTP por usuário no primeiro login e exibir QR Code (otpauth:// URI).
 * No `handleLogin()` / `handleAuthorize()`, exigir o código de 6 dígitos antes de emitir o authorization code.
@@ -208,14 +252,16 @@ Resposta inativa ou expirada:
 2. **Introspection:** token recém-criado retorna `active === true`; após `?action=revoke`, retorna `active === false`.
 3. **Public Client:** Authorization Code Flow com PKCE usando `spa_publica` **sem** `client_secret` retorna HTTP 200; sem `code_challenge` no `/authorize` retorna `invalid_request`.
 4. **JWT Bearer:** enviar `assertion` JWT assinado e validar HTTP 200; JWT com `aud` incorreto/expirado deve retornar `invalid_grant`.
+5. **Token Exchange:** trocar um `access_token` (subset de escopo) e validar `issued_token_type`; escopo maior retorna `invalid_scope`; `actor_token` inválido retorna `invalid_grant`; `audience` não permitida retorna `invalid_target`; o `subject_token` original permanece válido.
 
 **Pendentes (novos métodos):**
-5. **MFA / TOTP:**
+6. **MFA / TOTP:**
    * Login com código TOTP válido aprova; código inválido/expirado é rejeitado; reutilização do mesmo código é bloqueada.
 
 ### 6.2 Testes Manuais
 * Abrir `http://localhost:8001/oauth2_client.php` na aba **Device Flow**: ver o código na tela simulando uma CLI, abrir a URL no navegador, aprovar e observar a CLI receber o token automaticamente.
 * Abrir a aba **JWT Bearer**, gerar o JWT e solicitar o token.
+* Abrir a aba **Token Exchange**, colar um `access_token` obtido em outro flow, informar um `scope` menor (ex.: `openid`) e solicitar o token.
 * Testar `?action=introspect` com um token ativo e outro revogado.
 * Testar o cliente público `spa_publica` (fluxo Authorization Code com PKCE, sem `client_secret`).
 

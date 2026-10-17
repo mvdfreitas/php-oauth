@@ -907,6 +907,10 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     🔑 JWT Bearer<br>
                     <small>RFC 7523</small>
                 </a>
+                <a href="?flow=exchange" class="flow-button <?php echo $flow_type === 'exchange' ? 'active' : ''; ?>">
+                    🔄 Token Exchange<br>
+                    <small>RFC 8693</small>
+                </a>
             </div>
             
             <!-- AUTHORIZATION CODE FLOW -->
@@ -1394,6 +1398,98 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     } catch (error) {
                         document.getElementById('jwt-result').innerHTML = '<div class="error">✗ Erro na requisição: ' + error.message + '</div>';
                     }
+                }
+                </script>
+            <?php endif; ?>
+            
+            <?php if ($flow_type === 'exchange'): ?>
+                <div class="card">
+                    <h2>🔄 Token Exchange (RFC 8693)</h2>
+
+                    <div class="info-box">
+                        <strong>Como funciona:</strong>
+                        <ol style="margin-left: 1.5rem; margin-top: 0.5rem;">
+                            <li>Você já possui um access token (obtido em qualquer outro flow)</li>
+                            <li>Apresenta esse token como <code>subject_token</code></li>
+                            <li>O servidor valida e emite um novo token (ex.: com escopo menor)</li>
+                        </ol>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Subject Token (AT ou RT existente):</label>
+                        <textarea id="exchange_subject_token" rows="2" placeholder="Cole aqui o access_token obtido em outro flow" style="font-family: monospace; font-size: 0.8rem;"></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Subject Token Type:</label>
+                        <select id="exchange_subject_type">
+                            <option value="urn:ietf:params:oauth:token-type:access_token">access_token</option>
+                            <option value="urn:ietf:params:oauth:token-type:refresh_token">refresh_token</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Scope (subset do original; vazio = herda tudo):</label>
+                        <input type="text" id="exchange_scope" placeholder="openid">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Audience (opcional):</label>
+                        <input type="text" id="exchange_audience" placeholder="http://localhost:8000/api">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Actor Token (opcional — delegação):</label>
+                        <textarea id="exchange_actor_token" rows="2" style="font-family: monospace; font-size: 0.8rem;"></textarea>
+                    </div>
+
+                    <button type="button" onclick="requestTokenExchange()" style="width: 100%;">
+                        🔄 Solicitar Token Exchange
+                    </button>
+
+                    <div id="exchange-result" style="margin-top: 1rem;"></div>
+                </div>
+
+                <script>
+                function requestTokenExchange() {
+                    const result = document.getElementById('exchange-result');
+                    result.innerHTML = 'Consultando...';
+
+                    const formData = new URLSearchParams();
+                    formData.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+                    formData.append('client_id', '<?php echo $client_id; ?>');
+                    formData.append('client_secret', '<?php echo $client_secret; ?>');
+                    formData.append('subject_token', document.getElementById('exchange_subject_token').value.trim());
+                    formData.append('subject_token_type', document.getElementById('exchange_subject_type').value);
+
+                    const scope = document.getElementById('exchange_scope').value.trim();
+                    if (scope) formData.append('scope', scope);
+
+                    const aud = document.getElementById('exchange_audience').value.trim();
+                    if (aud) formData.append('audience', aud);
+
+                    const actor = document.getElementById('exchange_actor_token').value.trim();
+                    if (actor) {
+                        formData.append('actor_token', actor);
+                        formData.append('actor_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+                    }
+
+                    fetch('<?php echo $oauth_server; ?>/oauth2_complete.php?action=token', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: formData.toString()
+                    })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.error) {
+                            result.innerHTML = '<div class="error">✗ ' + data.error + ': ' + (data.error_description || '') + '</div>';
+                            return;
+                        }
+                        result.innerHTML = '<pre style="background:#f5f5f5; padding:1rem; border-radius:8px; overflow:auto; font-size:0.8rem;">' + JSON.stringify(data, null, 2) + '</pre>';
+                    })
+                    .catch(err => {
+                        result.innerHTML = '<div class="error">✗ Erro na requisição: ' + err.message + '</div>';
+                    });
                 }
                 </script>
             <?php endif; ?>
