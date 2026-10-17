@@ -65,7 +65,7 @@ $clients = [
             'http://localhost:3000/callback',
         ],
         'response_types' => ['code', 'token', 'id_token', 'id_token token'],
-    'grant_types' => ['authorization_code', 'refresh_token', 'implicit', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
+    'grant_types' => ['authorization_code', 'refresh_token', 'implicit', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code'],
     'token_endpoint_auth_method' => 'client_secret_basic',
     'logo_uri' => 'https://via.placeholder.com/200',
     'contacts' => ['admin@example.com'],
@@ -170,10 +170,6 @@ function base64UrlEncode($data) {
 }
 
 function base64UrlDecode($data) {
-    $padding = strlen($data) % 4;
-    if ($padding) {
-        $data .= str_repeat('=', 4 - $padding);
-    }
     return base64_decode(strtr($data, '-_', '+/'));
 }
 
@@ -210,101 +206,6 @@ function generateIdToken($username, $client_id, $nonce = null) {
     $signature = base64UrlEncode(hash_hmac('sha256', $signing_input, $config['jwt_secret'], true));
     
     return $signing_input . '.' . $signature;
-}
-
-function signJwt($data, $client_id, $algorithm = 'HS256') {
-    global $clients, $config;
-    $client = $clients[$client_id] ?? null;
-    if (!$client) {
-        return '';
-    }
-
-    if ($algorithm === 'HS256') {
-        $key = $client['client_secret'] ?? $config['jwt_secret'] ?? '';
-        return hash_hmac('sha256', $data, $key, true);
-    } elseif ($algorithm === 'RS256') {
-        $privateKey = $client['jwt_private_key'] ?? null;
-        if (!$privateKey) {
-            return '';
-        }
-        openssl_sign($data, $signature, $privateKey, OPENSSL_ALGO_SHA256);
-        return $signature;
-    }
-    return '';
-}
-
-function verifyJwtSignature($data, $signature, $client_id, $algorithm) {
-    global $clients, $config;
-    $client = $clients[$client_id] ?? null;
-    if (!$client) {
-        return false;
-    }
-
-    if ($algorithm === 'HS256') {
-        $key = $client['client_secret'] ?? $config['jwt_secret'] ?? '';
-        $expected = hash_hmac('sha256', $data, $key, true);
-        return hash_equals($expected, $signature);
-    } elseif ($algorithm === 'RS256') {
-        $publicKey = $client['jwt_public_key'] ?? null;
-        if (!$publicKey) {
-            return false;
-        }
-        return openssl_verify($data, $signature, $publicKey, OPENSSL_ALGO_SHA256) === 1;
-    }
-    return false;
-}
-
-function verifyJwt($jwt, $client_id = null) {
-    global $clients;
-    $parts = explode('.', $jwt);
-    if (count($parts) !== 3) {
-        return ['valid' => false, 'error' => 'invalid_format'];
-    }
-
-    list($headerEncoded, $payloadEncoded, $signatureEncoded) = $parts;
-
-    $header = json_decode(base64UrlDecode($headerEncoded), true);
-    if (!$header || !isset($header['alg'])) {
-        return ['valid' => false, 'error' => 'invalid_header'];
-    }
-
-    $algorithm = $header['alg'];
-    if ($algorithm === 'none') {
-        return ['valid' => false, 'error' => 'invalid_algorithm'];
-    }
-
-    $payload = json_decode(base64UrlDecode($payloadEncoded), true);
-    if (!$payload) {
-        return ['valid' => false, 'error' => 'invalid_payload'];
-    }
-
-    if ($client_id === null && isset($payload['iss'])) {
-        $client_id = $payload['iss'];
-    }
-
-    if (!$client_id || !isset($clients[$client_id])) {
-        return ['valid' => false, 'error' => 'invalid_issuer'];
-    }
-
-    $data = $headerEncoded . '.' . $payloadEncoded;
-    $signature = base64UrlDecode($signatureEncoded);
-
-    if (!verifyJwtSignature($data, $signature, $client_id, $algorithm)) {
-        return ['valid' => false, 'error' => 'invalid_signature'];
-    }
-
-    $now = time();
-    if (isset($payload['exp']) && $payload['exp'] < $now) {
-        return ['valid' => false, 'error' => 'token_expired'];
-    }
-    if (isset($payload['nbf']) && $payload['nbf'] > $now) {
-        return ['valid' => false, 'error' => 'token_not_yet_valid'];
-    }
-    if (isset($payload['iat']) && $payload['iat'] > $now + 60) {
-        return ['valid' => false, 'error' => 'invalid_issued_at'];
-    }
-
-    return ['valid' => true, 'payload' => $payload, 'client_id' => $client_id];
 }
 
 function jsonResponse($data, $statusCode = 200) {
@@ -1038,8 +939,6 @@ function handleToken() {
     // Suporta tanto POST quanto Basic Auth
     $client_id = $_POST['client_id'] ?? null;
     $client_secret = $_POST['client_secret'] ?? null;
-    $client_assertion_type = $_POST['client_assertion_type'] ?? null;
-    $client_assertion = $_POST['client_assertion'] ?? null;
     
     // Verificar Basic Auth
     $auth_header = getAuthorizationHeader();
@@ -1058,29 +957,12 @@ function handleToken() {
     $username = $_POST['username'] ?? null;
     $password = $_POST['password'] ?? null;
     
-    // Autenticação via JWT Bearer Assertion (RFC 7523 - Client Authentication)
-    if ($client_assertion_type === 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer' && $client_assertion) {
-        $jwtResult = verifyJwt($client_assertion);
-        if (!$jwtResult['valid']) {
-            return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client assertion inválido: ' . ($jwtResult['error'] ?? 'unknown')], 401);
-        }
-        $payload = $jwtResult['payload'];
-        if (($payload['iss'] ?? null) !== ($payload['sub'] ?? null)) {
-            return jsonResponse(['error' => 'invalid_client', 'error_description' => 'iss e sub devem ser idênticos'], 401);
-        }
-        if ($client_id && $client_id !== $payload['iss']) {
-            return jsonResponse(['error' => 'invalid_client', 'error_description' => 'client_id não corresponde ao iss'], 401);
-        }
-        $client_id = $payload['iss'];
-        $client_secret = $clients[$client_id]['client_secret'] ?? 'jwt-bearer-auth';
-    }
-    
     // Validações
     if (!$client_id || !isset($clients[$client_id])) {
         return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client ID inválido'], 400);
     }
     
-    if (!$client_assertion && $grant_type !== 'urn:ietf:params:oauth:grant-type:jwt-bearer' && $clients[$client_id]['client_secret'] !== $client_secret) {
+    if ($clients[$client_id]['client_secret'] !== $client_secret) {
         return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client secret inválido'], 401);
     }
     
@@ -1165,37 +1047,6 @@ function handleToken() {
     elseif ($grant_type === 'client_credentials') {
         $scope = $_POST['scope'] ?? 'openid profile';
         $username = $client_id; // Usar client_id como username
-    }
-    // ======================== JWT Bearer Assertion Grant (RFC 7523) ========================
-    elseif ($grant_type === 'urn:ietf:params:oauth:grant-type:jwt-bearer') {
-        $assertion = $_POST['assertion'] ?? null;
-        $scope = $_POST['scope'] ?? null;
-
-        if (!$assertion) {
-            return jsonResponse(['error' => 'invalid_request', 'error_description' => 'assertion ausente'], 400);
-        }
-
-        $jwtResult = verifyJwt($assertion);
-        if (!$jwtResult['valid']) {
-            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Assertion inválida: ' . ($jwtResult['error'] ?? 'unknown')], 400);
-        }
-
-        $payload = $jwtResult['payload'];
-
-        $tokenEndpoint = 'http://' . ($_SERVER['HTTP_HOST'] ?? 'localhost:8000') . $_SERVER['SCRIPT_NAME'] . '?action=token';
-        $aud = $payload['aud'] ?? null;
-        if ($aud !== $tokenEndpoint && (!is_array($aud) || !in_array($tokenEndpoint, $aud))) {
-            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Audience inválido'], 400);
-        }
-
-        $username = $payload['sub'] ?? $payload['iss'] ?? null;
-
-        if (isset($payload['scope'])) {
-            $scope = $payload['scope'];
-        }
-        if (!$scope) {
-            $scope = 'openid profile';
-        }
     }
     // ======================== Device Authorization Grant (RFC 8628) ========================
     elseif ($grant_type === 'urn:ietf:params:oauth:grant-type:device_code' || $grant_type === 'device_code') {
@@ -1524,23 +1375,13 @@ function handleWellKnown() {
         'introspection_endpoint' => $base . '?action=introspect',
         'response_types_supported' => ['code', 'token', 'id_token', 'id_token token', 'code token', 'code id_token', 'code id_token token'],
         'response_modes_supported' => ['query', 'fragment'],
-        'grant_types_supported' => [
-            'authorization_code',
-            'implicit',
-            'refresh_token',
-            'password',
-            'client_credentials',
-            'urn:ietf:params:oauth:grant-type:device_code',
-            'device_code',
-            'urn:ietf:params:oauth:grant-type:jwt-bearer'
-        ],
+        'grant_types_supported' => ['authorization_code', 'implicit', 'refresh_token', 'password', 'client_credentials'],
         'subject_types_supported' => ['public'],
         'id_token_signing_alg_values_supported' => ['HS256'],
         'scopes_supported' => ['openid', 'profile', 'email', 'address', 'phone'],
-        'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post', 'client_secret_jwt', 'private_key_jwt'],
+        'token_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
         'revocation_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
         'introspection_endpoint_auth_methods_supported' => ['client_secret_basic', 'client_secret_post'],
-        'token_endpoint_auth_signing_alg_values_supported' => ['HS256', 'RS256'],
         'code_challenge_methods_supported' => ['S256', 'plain'],
         'display_values_supported' => ['page', 'popup', 'touch', 'wap'],
         'claim_types_supported' => ['normal'],
