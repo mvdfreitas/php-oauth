@@ -65,8 +65,9 @@ $clients = [
             'http://localhost:3000/callback',
         ],
         'response_types' => ['code', 'token', 'id_token', 'id_token token'],
-    'grant_types' => ['authorization_code', 'refresh_token', 'implicit', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer'],
-    'token_endpoint_auth_method' => 'client_secret_basic',
+        'grant_types' => ['authorization_code', 'refresh_token', 'implicit', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'urn:ietf:params:oauth:grant-type:token-exchange'],
+        'allowed_audiences' => ['http://localhost:8000/api', 'api://gateway'],
+        'token_endpoint_auth_method' => 'client_secret_basic',
     'logo_uri' => 'https://via.placeholder.com/200',
     'contacts' => ['admin@example.com'],
 ],
@@ -465,6 +466,43 @@ function completeAuthorization(array $authParams, $username) {
 function parseScopes($scope_string) {
     if (!$scope_string) return [];
     return array_filter(explode(' ', trim($scope_string)));
+}
+
+// ============================================================================
+// TOKEN EXCHANGE (RFC 8693) — helpers
+// ============================================================================
+
+/**
+ * Localiza um token opaco (access ou refresh) no storage.
+ * Retorna ['bucket' => ..., 'data' => ...] ou null.
+ */
+function findOpaqueToken($token, $token_type_hint) {
+    $storage = loadStorage();
+
+    $buckets = ['access_tokens', 'refresh_tokens'];
+    if ($token_type_hint === 'urn:ietf:params:oauth:token-type:refresh_token') {
+        $buckets = ['refresh_tokens', 'access_tokens'];
+    }
+
+    foreach ($buckets as $bucket) {
+        if (!isset($storage[$bucket][$token])) {
+            continue;
+        }
+        $data = $storage[$bucket][$token];
+        if (time() > ($data['expires_at'] ?? 0)) {
+            return null;
+        }
+        return ['bucket' => $bucket, 'data' => $data];
+    }
+
+    return null;
+}
+
+/** true se todo escopo pedido está contido no escopo concedido ao subject_token. */
+function isScopeSubset($requested_scope, $granted_scope) {
+    $requested = parseScopes($requested_scope);
+    $granted   = parseScopes($granted_scope);
+    return empty(array_diff($requested, $granted));
 }
 
 function validateScopes($requested_scopes, $allowed_scopes) {
@@ -1127,6 +1165,7 @@ function handleToken() {
     }
     
     $storage = loadStorage();
+    $extra_token_meta = [];
     
     // ======================== Authorization Code Flow ========================
     if ($grant_type === 'authorization_code') {
@@ -1295,6 +1334,78 @@ function handleToken() {
             return jsonResponse(['error' => 'authorization_pending', 'error_description' => 'Autorização ainda pendente'], 400);
         }
     }
+    // ======================== Token Exchange (RFC 8693) ========================
+    elseif ($grant_type === 'urn:ietf:params:oauth:grant-type:token-exchange') {
+        $subject_token        = $_POST['subject_token'] ?? null;
+        $subject_token_type   = $_POST['subject_token_type'] ?? null;
+        $actor_token          = $_POST['actor_token'] ?? null;
+        $actor_token_type     = $_POST['actor_token_type'] ?? null;
+        $requested_token_type = $_POST['requested_token_type'] ?? null;
+        $requested_scope      = $_POST['scope'] ?? null;
+        $audience             = $_POST['audience'] ?? $_POST['resource'] ?? null;
+
+        $allowed_types = [
+            'urn:ietf:params:oauth:token-type:access_token',
+            'urn:ietf:params:oauth:token-type:refresh_token',
+        ];
+
+        if (!$subject_token || !$subject_token_type) {
+            return jsonResponse(['error' => 'invalid_request', 'error_description' => 'subject_token e subject_token_type são obrigatórios'], 400);
+        }
+        if (!in_array($subject_token_type, $allowed_types, true)) {
+            return jsonResponse(['error' => 'invalid_request', 'error_description' => 'subject_token_type não suportado'], 400);
+        }
+        if ($requested_token_type !== null
+            && $requested_token_type !== 'urn:ietf:params:oauth:token-type:access_token') {
+            return jsonResponse(['error' => 'invalid_request', 'error_description' => 'requested_token_type não suportado'], 400);
+        }
+
+        $subject = findOpaqueToken($subject_token, $subject_token_type);
+        if (!$subject) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'subject_token inválido ou expirado'], 400);
+        }
+        if ($subject['data']['client_id'] !== $client_id) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'subject_token não pertence a este cliente'], 400);
+        }
+
+        // Delegação: valida o actor_token com as mesmas regras do subject
+        $actor_id = null;
+        if ($actor_token !== null) {
+            if (!$actor_token_type || !in_array($actor_token_type, $allowed_types, true)) {
+                return jsonResponse(['error' => 'invalid_request', 'error_description' => 'actor_token_type obrigatório e deve ser suportado'], 400);
+            }
+            $actor = findOpaqueToken($actor_token, $actor_token_type);
+            if (!$actor || $actor['data']['client_id'] !== $client_id) {
+                return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'actor_token inválido ou não pertence a este cliente'], 400);
+            }
+            $actor_id = $actor['data']['username'];
+        }
+
+        // Escopo: subset do escopo do subject_token (nunca escala)
+        $scope = $requested_scope ?: $subject['data']['scope'];
+        if (!isScopeSubset($scope, $subject['data']['scope'])) {
+            return jsonResponse(['error' => 'invalid_scope', 'error_description' => 'scope solicitado excede o escopo do subject_token'], 400);
+        }
+
+        // Audiência: política por cliente (secure default: rejeitar se não configurado)
+        if ($audience !== null) {
+            $allowed_audiences = $clients[$client_id]['allowed_audiences'] ?? [];
+            if (!in_array($audience, $allowed_audiences, true)) {
+                return jsonResponse(['error' => 'invalid_target', 'error_description' => 'audience não permitida para este cliente'], 400);
+            }
+            $extra_token_meta['audience'] = $audience;
+        }
+
+        if ($actor_id !== null) {
+            $extra_token_meta['actor_id'] = $actor_id;   // delegação auditável
+        }
+
+        // O subject_token NÃO é revogado: a troca é não destrutiva (RFC 8693 §2.1)
+        $username = $subject['data']['username'];
+
+        // sinaliza ao bloco comum de emissão que não deve gerar novo refresh_token
+        $grant_type = 'token_exchange_opaque';
+    }
     else {
         return jsonResponse(['error' => 'unsupported_grant_type', 'error_description' => 'Grant type não suportado'], 400);
     }
@@ -1303,13 +1414,13 @@ function handleToken() {
     $access_token = generateToken();
     
     $storage['access_tokens'] = $storage['access_tokens'] ?? [];
-    $storage['access_tokens'][$access_token] = [
+    $storage['access_tokens'][$access_token] = array_merge([
         'client_id' => $client_id,
         'username' => $username,
         'scope' => $scope,
         'created_at' => time(),
         'expires_at' => time() + $config['access_token_expires'],
-    ];
+    ], $extra_token_meta);
     
     $response = [
         'access_token' => $access_token,
@@ -1318,8 +1429,8 @@ function handleToken() {
         'scope' => $scope,
     ];
     
-    // Refresh token (não se aplica a client_credentials)
-    if ($grant_type !== 'client_credentials') {
+    // Refresh token (não se aplica a client_credentials nem ao token exchange)
+    if (!in_array($grant_type, ['client_credentials', 'token_exchange_opaque'], true)) {
         $new_refresh_token = generateToken();
 
         $storage['refresh_tokens'] = $storage['refresh_tokens'] ?? [];
@@ -1339,6 +1450,11 @@ function handleToken() {
     // Adicionar id_token se openid scope
     if (in_array('openid', parseScopes($scope))) {
         $response['id_token'] = generateIdToken($username, $client_id, $nonce ?? null);
+    }
+    
+    // RFC 8693 §2.2.1: token exchange informa o tipo do token emitido
+    if ($grant_type === 'token_exchange_opaque') {
+        $response['issued_token_type'] = 'urn:ietf:params:oauth:token-type:access_token';
     }
     
     jsonResponse($response);
@@ -1543,6 +1659,14 @@ function handleIntrospect() {
             $response['username'] = $data['username'];
         }
 
+        // RFC 8693 §4.1: delegação e audiência registradas no token exchange
+        if (isset($data['actor_id'])) {
+            $response['act'] = ['sub' => $data['actor_id']];
+        }
+        if (isset($data['audience'])) {
+            $response['aud'] = $data['audience'];
+        }
+
         return jsonResponse($response);
     }
 
@@ -1576,7 +1700,8 @@ function handleWellKnown() {
             'client_credentials',
             'urn:ietf:params:oauth:grant-type:device_code',
             'device_code',
-            'urn:ietf:params:oauth:grant-type:jwt-bearer'
+            'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'urn:ietf:params:oauth:grant-type:token-exchange'
         ],
         'subject_types_supported' => ['public'],
         'id_token_signing_alg_values_supported' => ['HS256'],

@@ -57,6 +57,7 @@ php-oauth/
 | `docs/PLAN_IMPLICIT_FLOW.md` | 📋 Plano: Implicit Flow + melhorias de segurança |
 | `docs/PLAN_DEVICE_AUTHORIZATION_GRANT.md` | 📋 Plano: Device Authorization Grant (RFC 8628 - Device Flow) |
 | `docs/ANALISE_METODOS_AUTENTICACAO.md` | 📊 Análise: Métodos de Autenticação OAuth 2.0/2.1 e Mercado |
+| `docs/PLAN_TOKEN_EXCHANGE.md` | 📋 Plano: Token Exchange (RFC 8693) — troca/delegação de tokens |
 | `README.md` | Overview geral |
 | `docs/INDEX.md` | Este arquivo |
 
