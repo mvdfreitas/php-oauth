@@ -1,7 +1,7 @@
 # Análise de Métodos de Autenticação e Plano de Evolução (OAuth 2.0 / 2.1)
 
 **Projeto:** `php-oauth` (`server/oauth2_complete.php` e `client/oauth2_client.php`)  
-**Data:** 12 de Outubro de 2026  
+**Data:** 17 de Outubro de 2026 (atualização)  
 **Status:** Análise Técnica e Especificação de Mercado
 
 ---
@@ -23,8 +23,8 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 | **Password Flow (ROPC)** | RFC 6749 §4.3 | ✅ Sim | ⚠️ **OBSOLETO / DEPRECATED** | **Proibido no OAuth 2.1**. Viola o isolamento de credenciais |
 | **Device Authorization Grant** | RFC 8628 | ✅ Sim | 🔥 **ALTAMENTE UTILIZADO** | Padrão para CLIs (`gh`, `aws`, `gcloud`) e Smart TVs |
 | **Token Introspection** | RFC 7662 | ✅ Sim | 🔥 **PADRÃO DA INDÚSTRIA** | Essencial para APIs/Resource Servers com tokens opacos |
-| **Public Clients (PKCE sem secret)** | OAuth 2.1 / RFC 7636 | ❌ **Falta** | 🔥 **PADRÃO OBRIGATÓRIO** | SPAs e Apps Mobile não devem ter `client_secret` |
-| **JWT Bearer Assertion** | RFC 7523 | ❌ **Falta** | 💼 **MUITO UTILIZADO (Enterprise)** | Padrão de Service Accounts (Google Cloud, Salesforce) |
+| **Public Clients (PKCE sem secret)** | OAuth 2.1 / RFC 7636 | ✅ Sim | 🔥 **PADRÃO OBRIGATÓRIO** | SPAs e Apps Mobile não devem ter `client_secret` |
+| **JWT Bearer Assertion** | RFC 7523 | ✅ Sim | 💼 **MUITO UTILIZADO (Enterprise)** | Padrão de Service Accounts (Google Cloud, Salesforce) |
 | **Token Exchange** | RFC 8693 | ❌ **Falta** | 🏢 **MÉDIO/ENTERPRISE** | Usado em malhas de microsserviços / delegação |
 | **OIDC Hybrid Flow** | OIDC Core 1.0 | ❌ **Falta** | ⏳ **EM DECLÍNIO** | Pouco usado em novos projetos; superado por Code + PKCE |
 | **SAML 2.0 Assertion** | RFC 7522 | ❌ **Falta** | 🏛️ **LEGADO CORPORATIVO** | Apenas para migração de SSO corporativo legado |
@@ -34,30 +34,46 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 
 ## 2. Análise Detalhada dos Métodos Faltantes no Mercado
 
-### 2.1 Device Authorization Grant (RFC 8628 - "Device Flow")
-* **O que é:** Criado para dispositivos sem navegador integrado ou com entrada de texto restrita. O dispositivo solicita um código e recebe um `device_code` e um `user_code` curto (ex: `ABCD-1234`), exibindo uma URL (`/device`) para o usuário acessar no smartphone ou computador. Enquanto o usuário digita o código e autoriza na web, o dispositivo faz requisições periódicas (*polling*) até receber os tokens.
-* **Ainda é utilizado no mercado?** **SIM, MASSIVAMENTE!**
-  * **CLIs de Desenvolvedores:** `gh auth login` (GitHub CLI), `aws login`, `gcloud auth login` (Google Cloud SDK), `docker login`, `vercel login`, `supabase login`, `stripe login`.
-  * **Dispositivos Conectados:** YouTube e Netflix em Smart TVs, Spotify Connect, consoles de videogame (PlayStation, Xbox), Apple TV e IoT.
-* **Relevância para o projeto:** É a adição mais rica, moderna e didática que pode ser feita no `php-oauth`.
+> [!NOTE]
+> Device Authorization Grant (RFC 8628), Token Introspection (RFC 7662), Public Clients (OAuth 2.1) e JWT Bearer Assertion (RFC 7523) **já foram implementados** e foram movidos para a seção 3.
 
-### 2.2 Token Introspection (RFC 7662 - `/introspect`)
-* **O que é:** Um endpoint protegido onde um Resource Server (uma API que protege dados) consulta se um determinado token recebido no header `Authorization: Bearer <token>` ainda está ativo e quais são seus metadados (`active`, `scope`, `client_id`, `sub`, `exp`).
-* **Ainda é utilizado no mercado?** **SIM, É O PADRÃO DA INDÚSTRIA.**
-  * Como este projeto emite **tokens opacos** (strings hexadecimais aleatórias de 64 caracteres em vez de JWTs assinados para access token), as APIs externas não conseguem validar o token sozinhas sem consultar o servidor de autorização. O endpoint `/introspect` é suportado em todas as soluções de mercado (Keycloak, Auth0, Okta, Hydra).
+### 2.1 Token Exchange (RFC 8693)
+* **O que é:** Permite a um serviço trocar um *access token* recebido por outro token com escopo/audiência diferentes, mantendo a identidade original (`subject`) ou atuando em nome de outro (*delegation*).
+* **Ainda é utilizado no mercado?** **SIM, EM AMBIENTES ENTERPRISE / MICROSSERVIÇOS** (Kubernetes with SPIFFE/SPIRE, AWS, Google Cloud, Keycloak). Não é urgente para um projeto didático.
 
-### 2.3 Suporte a Clientes Públicos (Public Clients com PKCE sem `client_secret`)
-* **O que é:** O servidor atual do projeto (`oauth2_complete.php:939`) rejeita chamadas ao `/token` se o `client_secret` não for fornecido ou estiver incorreto. No entanto, por definição da especificação OAuth, **clientes públicos** (Single Page Apps em React/Vue e Aplicativos Mobile em iOS/Android/Flutter) rodam no ambiente do usuário e **não podem manter um segredo seguro**.
-* **Ainda é utilizado no mercado?** **SIM! É A REGRA FUNDAMENTAL DO OAUTH MODERNO (OAuth 2.1).** Clientes públicos devem usar `client_id` + PKCE (`code_verifier`), sem nenhum `client_secret`.
+### 2.2 MFA / TOTP no Login (RFC 6238)
+* **O que é:** Segundo fator (código de 6 dígitos rotativo) exigido no momento da autenticação do usuário, antes da emissão do authorization code ou do token.
+* **Ainda é utilizado no mercado?** **SIM, PADRÃO UNIVERSAL** — exigido por Google, GitHub, Microsoft e pela maioria das normas de segurança (NIST 800-63B).
 
-### 2.4 JWT Bearer Token Grant (RFC 7523 - Service Accounts)
-* **O que é:** Um fluxo machine-to-machine onde o cliente não envia uma senha fixa (`client_secret`), mas sim um JWT assinado com uma chave privada RSA/ECDSA gerada pelo próprio cliente.
-* **Ainda é utilizado no mercado?** **SIM, MUITO UTILIZADO EM NUVEM E ENTERPRISE.**
-  * É a base de autenticação das contas de serviço do Google Cloud (Service Account JSON) e integrações corporativas com Salesforce, AWS STS e Box.
+### 2.3 OIDC Hybrid Flow (OIDC Core 1.0)
+* **O que é:** Variante que retorna code e/ou tokens na primeira chamada de `/authorize` (fragmento ou query).
+* **Ainda é utilizado no mercado?** **EM DECLÍNIO** — superado por Authorization Code + PKCE; mantido apenas por compatibilidade.
+
+### 2.4 SAML 2.0 Assertion (RFC 7522)
+* **O que é:** Permite autenticação de clientes mediante uma assertion SAML assinada, no lugar de `client_secret`.
+* **Ainda é utilizado no mercado?** **LEGADO CORPORATIVO** — apenas para migração de SSO corporativo antigo.
 
 ---
 
 ## 3. Estado dos Métodos que o Projeto JÁ Possui
+
+### 3.1 Métodos Implementados
+
+| Método / Fluxo | Endpoint / Grant no Projeto | Documentação |
+| :--- | :--- | :--- |
+| Authorization Code + PKCE | `?action=authorize` → `?action=token` (`grant_type=authorization_code`, `code_verifier`) | `docs/IMPLEMENTACAO_AUTHORIZATION_CODE_FLOW.md` |
+| Client Credentials | `grant_type=client_credentials` | `server/oauth2_complete.php` (painel `/debug`) |
+| Refresh Token (com rotação) | `grant_type=refresh_token` | `server/oauth2_complete.php` |
+| Token Revocation | `?action=revoke` (RFC 7009) | `server/oauth2_complete.php` |
+| UserInfo & OIDC Discovery | `?action=userinfo`, `?action=well-known` | `server/oauth2_complete.php` |
+| Implicit Flow ⚠️ | `response_type=token` | `docs/PLAN_IMPLICIT_FLOW.md` |
+| Password Flow (ROPC) ⚠️ | `grant_type=password` | `server/oauth2_complete.php` |
+| **Device Authorization Grant** ✅ *novo* | `?action=device_code`, `?action=device`, `grant_type=device_code` (RFC 8628) | `docs/DEVICE_AUTHORIZATION_GRANT.md` |
+| **Token Introspection** ✅ *novo* | `?action=introspect` (RFC 7662) | `docs/TOKEN_INTROSPECTION.md` |
+| **Public Clients (PKCE sem secret)** ✅ *novo* | `isPublicClient()` + cliente `spa_publica`; PKCE obrigatório no `/authorize`, `client_secret` dispensado no `/token` | `docs/IMPLEMENTACAO_PUBLIC_CLIENTS.md` |
+| **JWT Bearer Assertion** ✅ *novo* | `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` + `client_assertion` (RFC 7523) | `docs/PLAN_JWT_BEARER_ASSERTION.md` |
+
+O cliente (`client/oauth2_client.php`) possui abas interativas para Authorization Code, Implicit, Password, Client Credentials, **Device Flow** e **JWT Bearer**.
 
 > [!WARNING]
 > ### Alerta sobre Métodos Obsoletos Já Presentes no Código
@@ -72,27 +88,33 @@ Caso deseje implementar novos métodos no projeto, propomos uma evolução modul
 
 ```mermaid
 flowchart TD
-    subgraph Fase1["Fase 1: Métodos de Maior Impacto e Padrão de Mercado"]
-        A["Device Authorization Grant (RFC 8628)"]
-        B["Token Introspection (RFC 7662)"]
-        C["Suporte a Clientes Públicos sem secret (OAuth 2.1)"]
+    subgraph Fase1["Fase 1: Impacto e Padrão de Mercado ✅ Concluída"]
+        C["Suporte a Clientes Públicos sem secret (OAuth 2.1) ✅"]
+        C2["Device Authorization Grant (RFC 8628) ✅"]
+        C3["Token Introspection (RFC 7662) ✅"]
     end
 
     subgraph Fase2["Fase 2: Métodos Enterprise / Avançados"]
-        D["JWT Bearer Assertion (RFC 7523)"]
+        D["JWT Bearer Assertion (RFC 7523) ✅"]
         E["MFA / TOTP na Autenticação do Usuário"]
     end
 
-    Fase1 --> Fase2
+    subgraph Fase3["Fase 3: Opcional / Específico"]
+        F["Token Exchange (RFC 8693)"]
+        G["OIDC Hybrid Flow / SAML 2.0 (legado)"]
+    end
+
+    Fase1 --> Fase2 --> Fase3
 ```
 
 ---
 
-## 5. Especificação Técnica da Fase 1 (Recomendada)
+## 5. Especificação Técnica das Fases
 
-### 5.1 Componente A: Device Authorization Grant (RFC 8628)
+### 5.1 Componente Concluído: Device Authorization Grant (RFC 8628) ✅
 
-#### Fluxo Operacional:
+> Implementado em `server/oauth2_complete.php` (`handleDeviceAuthorization()`, `handleDevice()` e `grant_type=device_code` em `handleToken()`) e na aba "📺 Device Flow" do `client/oauth2_client.php`. Detalhes em `docs/DEVICE_AUTHORIZATION_GRANT.md` e `docs/PLAN_DEVICE_AUTHORIZATION_GRANT.md`.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -118,19 +140,12 @@ sequenceDiagram
     S-->>D: 200 OK com access_token, refresh_token e id_token!
 ```
 
-#### Arquivos a Modificar:
-* `server/oauth2_complete.php`:
-  * Novo endpoint `action=device_code`: gera `device_code`, `user_code` de 8 caracteres legíveis (ex: `BCDF-GHJK`), armazena em `$storage['device_codes']`.
-  * Novo endpoint `action=device`: tela HTML onde o usuário digita o `user_code`, visualiza os escopos solicitados pelo cliente e clica em autorizar.
-  * Suporte em `handleToken()` para `grant_type=urn:ietf:params:oauth:grant-type:device_code`. Responde `authorization_pending`, `slow_down` ou entrega tokens.
-* `client/oauth2_client.php`:
-  * Nova aba "📺 Device Flow (CLI / TV)", simulando a tela de um terminal CLI ou Smart TV fazendo o polling em tempo real via JavaScript/Fetch.
-
 ---
 
-### 5.2 Componente B: Token Introspection (RFC 7662)
+### 5.2 Componente Concluído: Token Introspection (RFC 7662) ✅
 
-#### Fluxo Operacional:
+> Implementado em `server/oauth2_complete.php` (`handleIntrospect()`, rota `action=introspect`, anunciado no `?action=well-known`). Detalhes em `docs/TOKEN_INTROSPECTION.md`.
+
 Um Resource Server (API) recebe `Authorization: Bearer <token>` e precisa saber se o token é válido:
 ```bash
 POST /oauth2_complete.php?action=introspect
@@ -161,27 +176,46 @@ Resposta inativa ou expirada:
 
 ---
 
-### 5.3 Componente C: Suporte a Clientes Públicos (Public Clients)
+### 5.3 Componente Concluído: Suporte a Clientes Públicos (Public Clients) ✅
 
-* Permitir clientes no `$clients` com `'public' => true` ou `'client_secret' => null`.
-* No endpoint `/token`, se o cliente for público e estiver usando `grant_type=authorization_code`, **dispensar a verificação de `client_secret`**, exigindo estritamente a validação do `code_verifier` (PKCE com método `S256`).
+> Implementado em `server/oauth2_complete.php`: helper `isPublicClient()` (aceita `'public' => true` ou `'client_secret' => null`), cliente de exemplo `spa_publica` (`token_endpoint_auth_method => none`), PKCE obrigatório no `/authorize` (`oauth2_complete.php:470`) e dispensa de `client_secret` no `/token` (`oauth2_complete.php:1006`). Detalhes em `docs/IMPLEMENTACAO_PUBLIC_CLIENTS.md`.
+
+* Clientes públicos usam apenas `client_id` + PKCE (`code_verifier`), sem `client_secret`.
+* O `/authorize` recusa autorização de cliente público sem `code_challenge`; o `/token` valida `code_verifier` via `verifyPkce()`.
+
+---
+
+### 5.4 Componente Concluído: JWT Bearer Assertion (RFC 7523) ✅
+
+> Implementado em `server/oauth2_complete.php`: autenticação de cliente via `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` (`verifyJwt()`), grant `urn:ietf:params:oauth:grant-type:jwt-bearer` em `handleToken()` (valida `iss`/`sub`, `aud` e escopo), `client_secret_jwt`/`private_key_jwt` anunciados no `?action=well-known` e aba "🔑 JWT Bearer" no cliente. Reimplementado após o revert `5ae4ef0`, agora integrado ao suporte a clientes públicos (`isPublicClient()`). Detalhes em `docs/PLAN_JWT_BEARER_ASSERTION.md`.
+
+---
+
+### 5.5 Componente Pendente B: MFA / TOTP no Login (RFC 6238)
+
+* Gerar segredo TOTP por usuário no primeiro login e exibir QR Code (otpauth:// URI).
+* No `handleLogin()` / `handleAuthorize()`, exigir o código de 6 dígitos antes de emitir o authorization code.
+* Cache de códigos usados (janela de 1 passo) para evitar replay.
 
 ---
 
 ## 6. Plano de Verificação e Testes
 
 ### 6.1 Testes Automatizados (cURL / PHP CLI)
-1. **Device Flow:**
-   * Iniciar fluxo via cURL e obter `device_code` e `user_code`.
-   * Testar polling recebendo `authorization_pending`.
-   * Aprovar via requisição simulada e validar se o próximo polling recebe `access_token`.
-2. **Introspection:**
-   * Testar token recém-criado: verificar `active === true`.
-   * Revogar token e testar introspection: verificar `active === false`.
-3. **Public Client:**
-   * Executar Authorization Code Flow com PKCE usando cliente público sem enviar `client_secret`: deve aprovar com HTTP 200.
+
+**Já cobertos (regressão):**
+1. **Device Flow:** iniciar fluxo via cURL, receber `authorization_pending` no polling, aprovar e validar a entrega do `access_token`.
+2. **Introspection:** token recém-criado retorna `active === true`; após `?action=revoke`, retorna `active === false`.
+3. **Public Client:** Authorization Code Flow com PKCE usando `spa_publica` **sem** `client_secret` retorna HTTP 200; sem `code_challenge` no `/authorize` retorna `invalid_request`.
+4. **JWT Bearer:** enviar `assertion` JWT assinado e validar HTTP 200; JWT com `aud` incorreto/expirado deve retornar `invalid_grant`.
+
+**Pendentes (novos métodos):**
+5. **MFA / TOTP:**
+   * Login com código TOTP válido aprova; código inválido/expirado é rejeitado; reutilização do mesmo código é bloqueada.
 
 ### 6.2 Testes Manuais
-* Abrir `http://localhost:8001/oauth2_client.php` na aba **Device Flow**.
-* Ver o código na tela simulando uma CLI, abrir a URL no navegador, aprovar e observar a CLI receber o token automaticamente.
+* Abrir `http://localhost:8001/oauth2_client.php` na aba **Device Flow**: ver o código na tela simulando uma CLI, abrir a URL no navegador, aprovar e observar a CLI receber o token automaticamente.
+* Abrir a aba **JWT Bearer**, gerar o JWT e solicitar o token.
+* Testar `?action=introspect` com um token ativo e outro revogado.
+* Testar o cliente público `spa_publica` (fluxo Authorization Code com PKCE, sem `client_secret`).
 

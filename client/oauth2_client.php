@@ -903,6 +903,10 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     📺 Device Flow<br>
                     <small>CLI / TV</small>
                 </a>
+                <a href="?flow=jwt" class="flow-button <?php echo $flow_type === 'jwt' ? 'active' : ''; ?>">
+                    🔑 JWT Bearer<br>
+                    <small>RFC 7523</small>
+                </a>
             </div>
             
             <!-- AUTHORIZATION CODE FLOW -->
@@ -1242,6 +1246,154 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     const el = document.getElementById('device-error');
                     el.textContent = msg;
                     el.style.display = 'block';
+                }
+                </script>
+            <?php endif; ?>
+
+            <!-- JWT BEARER FLOW -->
+            <?php if ($flow_type === 'jwt'): ?>
+                <div class="card">
+                    <h2>🔑 JWT Bearer Assertion (RFC 7523)</h2>
+
+                    <div class="info-box">
+                        <strong>Como funciona:</strong>
+                        <ol style="margin-left: 1.5rem; margin-top: 0.5rem;">
+                            <li>Gera um JWT assinado com client_secret (HS256)</li>
+                            <li>Envia como <code>assertion</code> com <code>grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer</code></li>
+                            <li>Servidor valida assinatura e claims (iss, sub, aud, exp)</li>
+                            <li>Recebe access token</li>
+                        </ol>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Grant Type:</label>
+                        <select id="jwt_grant_type">
+                            <option value="urn:ietf:params:oauth:grant-type:jwt-bearer">JWT Bearer Grant</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Signing Algorithm:</label>
+                        <select id="jwt_alg">
+                            <option value="HS256">HS256 (HMAC-SHA256 - usa client_secret)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Issuer (iss):</label>
+                        <input type="text" id="jwt_iss" value="cliente_teste">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Subject (sub):</label>
+                        <input type="text" id="jwt_sub" value="usuario1" placeholder="Username para o grant">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Audience (aud):</label>
+                        <input type="text" id="jwt_aud" value="<?php echo $oauth_server; ?>/oauth2_complete.php?action=token">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Scope:</label>
+                        <input type="text" id="jwt_scope" value="openid profile email">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Expiração (segundos):</label>
+                        <input type="number" id="jwt_exp_seconds" value="300" min="60" max="3600">
+                    </div>
+
+                    <button type="button" onclick="generateAndRequestJwtBearer()" style="width: 100%;">Gerar JWT e Solicitar Token</button>
+
+                    <div class="form-group" style="margin-top: 1.5rem;">
+                        <label>JWT Gerado:</label>
+                        <textarea id="jwt_generated" rows="4" readonly style="font-family: monospace; font-size: 0.85rem;"></textarea>
+                    </div>
+
+                    <div id="jwt-result" style="margin-top: 1rem;"></div>
+                </div>
+
+                <script>
+                async function base64UrlEncodeStr(str) {
+                    const bytes = new TextEncoder().encode(str);
+                    let binary = '';
+                    bytes.forEach(b => binary += String.fromCharCode(b));
+                    let base64 = btoa(binary);
+                    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+                }
+
+                async function generateJwtClientSide() {
+                    const alg = document.getElementById('jwt_alg').value;
+                    const iss = document.getElementById('jwt_iss').value;
+                    const sub = document.getElementById('jwt_sub').value;
+                    const aud = document.getElementById('jwt_aud').value;
+                    const scope = document.getElementById('jwt_scope').value;
+                    const expSeconds = parseInt(document.getElementById('jwt_exp_seconds').value);
+
+                    const now = Math.floor(Date.now() / 1000);
+                    const header = { alg: alg, typ: 'JWT' };
+                    const payload = {
+                        iss: iss,
+                        sub: sub,
+                        aud: aud,
+                        exp: now + expSeconds,
+                        iat: now,
+                        jti: 'jwt_' + Math.random().toString(36).substring(2, 15)
+                    };
+                    if (scope) payload.scope = scope;
+
+                    const headerEnc = await base64UrlEncodeStr(JSON.stringify(header));
+                    const payloadEnc = await base64UrlEncodeStr(JSON.stringify(payload));
+                    const data = headerEnc + '.' + payloadEnc;
+
+                    let signatureEnc = '';
+                    if (alg === 'HS256') {
+                        const key = await crypto.subtle.importKey(
+                            'raw',
+                            new TextEncoder().encode('<?php echo $client_secret; ?>'),
+                            { name: 'HMAC', hash: 'SHA-256' },
+                            false,
+                            ['sign']
+                        );
+                        const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+                        const sigArray = new Uint8Array(signature);
+                        let sigBinary = '';
+                        sigArray.forEach(b => sigBinary += String.fromCharCode(b));
+                        const sigBase64 = btoa(sigBinary);
+                        signatureEnc = sigBase64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+                    }
+
+                    const jwt = data + '.' + signatureEnc;
+                    document.getElementById('jwt_generated').value = jwt;
+                    return jwt;
+                }
+
+                async function generateAndRequestJwtBearer() {
+                    const jwt = await generateJwtClientSide();
+                    if (!jwt || jwt.endsWith('.')) return;
+
+                    const formData = new URLSearchParams();
+                    formData.append('grant_type', 'urn:ietf:params:oauth:grant-type:jwt-bearer');
+                    formData.append('assertion', jwt);
+                    formData.append('client_id', '<?php echo $client_id; ?>');
+
+                    try {
+                        const response = await fetch('<?php echo $oauth_server; ?>/oauth2_complete.php?action=token', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: formData
+                        });
+                        const data = await response.json();
+                        const resultDiv = document.getElementById('jwt-result');
+                        if (data.access_token) {
+                            resultDiv.innerHTML = '<div class="success">✓ Token obtido com sucesso!</div><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                        } else {
+                            resultDiv.innerHTML = '<div class="error">✗ Erro: ' + (data.error_description || data.error) + '</div><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                        }
+                    } catch (error) {
+                        document.getElementById('jwt-result').innerHTML = '<div class="error">✗ Erro na requisição: ' + error.message + '</div>';
+                    }
                 }
                 </script>
             <?php endif; ?>
