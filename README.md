@@ -33,6 +33,7 @@ php -S localhost:8001 client/callback.php
 - Use as credenciais:
   - **Usuário:** usuario1
   - **Senha:** senha123
+  - **MFA:** exigido (TOTP) — configure o segredo exibido no primeiro login ou use `php server/totp_code.php usuario1`
   
   ou
   
@@ -130,9 +131,11 @@ Interface visual para ver:
 
 ### Usuários:
 ```
-usuario1 / senha123
+usuario1 / senha123   (MFA/TOTP habilitado)
 usuario2 / senha456
 ```
+
+> **MFA / TOTP (RFC 6238):** `usuario1` exige segundo fator no login interativo (`/authorize`) e no Device Flow. No primeiro login, o servidor exibe o segredo Base32 e a URI `otpauth://` para configurar em um app autenticador (Google Authenticator, Authy, etc.). Para testes via CLI, use `php server/totp_code.php usuario1` para obter o código atual. Detalhes em `docs/PLAN_MFA_TOTP.md`.
 
 ### Cliente OAuth2:
 ```
@@ -246,7 +249,8 @@ Acesse http://localhost:8000/oauth2_server.php?action=debug para ver:
 php-oauth/
 ├── server/
 │   ├── oauth2_server.php        ← Servidor simples (Authorization Code)
-│   └── oauth2_complete.php      ← Servidor completo (4 grant types + OIDC)
+│   ├── oauth2_complete.php      ← Servidor completo (4 grant types + OIDC)
+│   └── totp_code.php            ← CLI: gera código TOTP atual (MFA)
 ├── client/
 │   ├── callback.php             ← Cliente simples
 │   └── oauth2_client.php        ← Cliente completo (4 flows)

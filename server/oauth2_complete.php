@@ -27,6 +27,7 @@ $config = [
 $users = [
     'usuario1' => [
         'password' => 'senha123',
+        'mfa' => true,
         'email' => 'usuario1@example.com',
         'name' => 'Usuário Um',
         'phone_number' => '+55 11 98765-4321',
@@ -210,6 +211,201 @@ function base64UrlDecode($data) {
         $data .= str_repeat('=', 4 - $padding);
     }
     return base64_decode(strtr($data, '-_', '+/'));
+}
+
+// ============================================================================
+// MFA / TOTP (RFC 6238) — helpers
+// ============================================================================
+
+function base32Encode($data) {
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    $bytes = unpack('C*', $data);
+    $binary = '';
+    foreach ($bytes as $byte) {
+        $binary .= str_pad(decbin($byte), 8, '0', STR_PAD_LEFT);
+    }
+    $fiveBit = str_split($binary, 5);
+    $result = '';
+    foreach ($fiveBit as $chunk) {
+        $result .= $alphabet[bindec($chunk)];
+    }
+    return $result;
+}
+
+function base32Decode($string) {
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    $string = strtoupper(rtrim($string, '='));
+    $binary = '';
+    for ($i = 0; $i < strlen($string); $i++) {
+        $pos = strpos($alphabet, $string[$i]);
+        if ($pos === false) {
+            return false;
+        }
+        $binary .= str_pad(decbin($pos), 5, '0', STR_PAD_LEFT);
+    }
+    $bytes = [];
+    foreach (str_split($binary, 8) as $chunk) {
+        if (strlen($chunk) === 8) {
+            $bytes[] = bindec($chunk);
+        }
+    }
+    return pack('C*', ...$bytes);
+}
+
+function generateTotpSecret() {
+    return base32Encode(random_bytes(20)); // 160 bits
+}
+
+function totpGenerate($secret, $time = null) {
+    if ($time === null) {
+        $time = time();
+    }
+    $counter = intdiv($time, 30);
+    $secretBytes = base32Decode($secret);
+    if ($secretBytes === false) {
+        return '';
+    }
+    // Counter de 8 bytes big-endian
+    $counterPacked = pack('NN', intdiv($counter, 0x100000000), $counter % 0x100000000);
+    $hmac = hash_hmac('sha1', $counterPacked, $secretBytes, true);
+    $offset = ord($hmac[19]) & 0x0F;
+    $code = ((ord($hmac[$offset]) & 0x7F) << 24)
+          | ((ord($hmac[$offset + 1]) & 0xFF) << 16)
+          | ((ord($hmac[$offset + 2]) & 0xFF) << 8)
+          | (ord($hmac[$offset + 3]) & 0xFF);
+    $code = $code % 1000000;
+    return str_pad((string) $code, 6, '0', STR_PAD_LEFT);
+}
+
+function totpVerify($secret, $code, $window = 1) {
+    if (strlen($code) !== 6 || !ctype_digit($code)) {
+        return false;
+    }
+    $counter = intdiv(time(), 30);
+    for ($i = -$window; $i <= $window; $i++) {
+        $expected = totpGenerate($secret, ($counter + $i) * 30);
+        if (hash_equals($expected, $code)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function totpOtpauthUri($username, $secret) {
+    $issuer = 'php-oauth';
+    $label = $issuer . ':' . $username;
+    $params = http_build_query([
+        'secret' => $secret,
+        'issuer' => $issuer,
+        'algorithm' => 'SHA1',
+        'digits' => '6',
+        'period' => '30',
+    ]);
+    return 'otpauth://totp/' . rawurlencode($label) . '?' . $params;
+}
+
+/**
+ * Processa a submissão de um código TOTP contra o estado pendente na sessão.
+ *
+ * Estado esperado em $_SESSION: mfa_pending_user, mfa_pending_secret (enrollment),
+ * mfa_attempts.
+ *
+ * @return array{
+ *     fatal: bool,          // true = voltar ao login de senha (rate limit / erro interno)
+ *     success: bool,        // true = autenticado, pendências limpas
+ *     error: string,        // mensagem para exibir no form TOTP quando !fatal && !success
+ *     user: ?string,        // usuário autenticado quando success
+ *     is_enrollment: bool,  // true = exibir tela de enrollment no erro
+ *     secret: ?string       // secret pendente do enrollment (quando is_enrollment)
+ * }
+ */
+function processTotpSubmission($code) {
+    $fatal = ['fatal' => true, 'success' => false, 'error' => '', 'user' => null, 'is_enrollment' => false, 'secret' => null];
+    $pending_user = $_SESSION['mfa_pending_user'] ?? null;
+    if ($pending_user === null || $code === '') {
+        return array_merge($fatal, ['error' => 'Sessão MFA expirada. Faça login novamente.']);
+    }
+
+    $is_enrollment = !empty($_SESSION['mfa_pending_secret']);
+    $storage = loadStorage();
+    $attempts = (int) ($_SESSION['mfa_attempts'] ?? 0);
+
+    if ($attempts >= 5) {
+        unset($_SESSION['mfa_pending_user'], $_SESSION['mfa_pending_secret'], $_SESSION['mfa_attempts']);
+        return array_merge($fatal, ['error' => 'Muitas tentativas TOTP. Faça login novamente.']);
+    }
+
+    $secret = $is_enrollment
+        ? ($_SESSION['mfa_pending_secret'] ?? null)
+        : ($storage['totp_secrets'][$pending_user]['secret'] ?? null);
+    if ($secret === null) {
+        unset($_SESSION['mfa_pending_user'], $_SESSION['mfa_pending_secret'], $_SESSION['mfa_attempts']);
+        return array_merge($fatal, ['error' => 'Erro interno MFA. Tente novamente.']);
+    }
+
+    $fail = function ($error) use ($pending_user, $is_enrollment, $secret, $attempts) {
+        $new_attempts = $attempts + 1;
+        $_SESSION['mfa_attempts'] = $new_attempts;
+        if ($new_attempts >= 5) {
+            unset($_SESSION['mfa_pending_user'], $_SESSION['mfa_pending_secret'], $_SESSION['mfa_attempts']);
+            return [
+                'fatal' => true,
+                'success' => false,
+                'error' => 'Muitas tentativas TOTP. Faça login novamente.',
+                'user' => null,
+                'is_enrollment' => false,
+                'secret' => null,
+            ];
+        }
+        return [
+            'fatal' => false,
+            'success' => false,
+            'error' => $error,
+            'user' => $pending_user,
+            'is_enrollment' => $is_enrollment,
+            'secret' => $is_enrollment ? $secret : null,
+        ];
+    };
+
+    if (!totpVerify($secret, $code)) {
+        return $fail($is_enrollment
+            ? 'Código TOTP inválido. Verifique o app autenticador.'
+            : 'Código TOTP inválido. Tente novamente (' . (5 - $attempts - 1) . ' tentativas restantes).');
+    }
+
+    // Replay protection: counter do período atual não pode ser reutilizado (TTL 90s)
+    $counter = intdiv(time(), 30);
+    $used_ts = $storage['totp_used'][$pending_user][$counter] ?? null;
+    if ($used_ts !== null && (time() - (int) $used_ts) < 90) {
+        return $fail('Código TOTP já utilizado. Aguarde o próximo período.');
+    }
+
+    // Sucesso: grava counter e poda expirados (TTL 90s)
+    $storage['totp_used'][$pending_user][$counter] = time();
+    foreach ($storage['totp_used'][$pending_user] as $c => $ts) {
+        if (time() - (int) $ts >= 90) {
+            unset($storage['totp_used'][$pending_user][$c]);
+        }
+    }
+    if ($is_enrollment) {
+        $storage['totp_secrets'][$pending_user] = [
+            'secret' => $secret,
+            'created_at' => time(),
+        ];
+    }
+    saveStorage($storage);
+
+    unset($_SESSION['mfa_pending_user'], $_SESSION['mfa_pending_secret'], $_SESSION['mfa_attempts']);
+    $_SESSION['oauth_authenticated_user'] = $pending_user;
+
+    return [
+        'fatal' => false,
+        'success' => true,
+        'error' => '',
+        'user' => $pending_user,
+        'is_enrollment' => false,
+        'secret' => null,
+    ];
 }
 
 function generateIdToken($username, $client_id, $nonce = null) {
@@ -1085,12 +1281,19 @@ function handleAuthorize() {
         && isset($_POST['username'], $_POST['password'])
         && trim((string) $_POST['password']) !== '';
 
+    // MFA / TOTP: POST com código TOTP (enrollment ou verificação)
+    $is_totp_post = $_SERVER['REQUEST_METHOD'] === 'POST'
+        && isset($_POST['totp_code'])
+        && !empty($_SESSION['mfa_pending_user']);
+
     if ($is_login_post) {
         $username_input = trim((string) $_POST['username']);
         $password = trim((string) $_POST['password']);
 
         // Uma nova tentativa de login invalida qualquer autenticação anterior
         unset($_SESSION['oauth_authenticated_user']);
+        // Limpa estados MFA pendentes
+        unset($_SESSION['mfa_pending_user'], $_SESSION['mfa_pending_secret'], $_SESSION['mfa_attempts']);
 
         if ($username_input === '' || $password === '') {
             return showLoginForm($authParams, 'Usuário e senha são obrigatórios', $login_hint);
@@ -1102,9 +1305,40 @@ function handleAuthorize() {
             return showLoginForm($authParams, 'Senha incorreta', $login_hint);
         }
 
-        // Credenciais válidas: registra a autenticação na sessão
+        // Credenciais válidas: verificar se usuário tem MFA habilitado
+        if (!empty($users[$username_input]['mfa'])) {
+            $storage = loadStorage();
+            $stored_secret = $storage['totp_secrets'][$username_input]['secret'] ?? null;
+
+            if ($stored_secret === null) {
+                // Enrollment: gerar secret temporário e exibir tela de configuração
+                $pending_secret = generateTotpSecret();
+                $_SESSION['mfa_pending_user'] = $username_input;
+                $_SESSION['mfa_pending_secret'] = $pending_secret;
+                $_SESSION['mfa_attempts'] = 0;
+                return showTotpForm($authParams, $username_input, $pending_secret, true);
+            } else {
+                // Já tem secret: exigir código TOTP
+                $_SESSION['mfa_pending_user'] = $username_input;
+                $_SESSION['mfa_attempts'] = 0;
+                return showTotpForm($authParams, $username_input, null, false);
+            }
+        }
+
+        // Sem MFA: registra a autenticação direto
         $_SESSION['oauth_authenticated_user'] = $username_input;
         $username = $username_input;
+    } elseif ($is_totp_post) {
+        $totp_code = trim((string) $_POST['totp_code']);
+        $result = processTotpSubmission($totp_code);
+        if ($result['fatal']) {
+            return showLoginForm($authParams, $result['error'] ?: 'Muitas tentativas TOTP. Faça login novamente.', $login_hint);
+        }
+        if ($result['success']) {
+            $username = $result['user'];
+        } else {
+            return showTotpForm($authParams, $result['user'], $result['secret'], $result['is_enrollment'], $result['error']);
+        }
     } else {
         $username = $_SESSION['oauth_authenticated_user'] ?? null;
     }
@@ -1395,6 +1629,222 @@ function showLoginForm(array $authParams, $error = '', $login_hint = '') {
                     <?php if ($authParams['code_challenge']): ?><br>PKCE: <?php echo htmlspecialchars($authParams['code_challenge_method']); ?><?php endif; ?>
                 </div>
             <?php endif; ?>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+function showTotpForm(array $authParams, $username, $pending_secret = null, $is_enrollment = false, $error = '') {
+    global $clients;
+
+    $client_id = $authParams['client_id'];
+    $client_name = $clients[$client_id]['client_name'] ?? $client_id;
+    $otpauth_uri = $is_enrollment && $pending_secret !== null
+        ? totpOtpauthUri($username, $pending_secret)
+        : null;
+    ?>
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>OAuth2 - <?php echo $is_enrollment ? 'Configurar MFA' : 'Verificação MFA'; ?></title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                padding: 1rem;
+            }
+            .container {
+                background: white;
+                padding: 2rem;
+                border-radius: 12px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                width: 100%;
+                max-width: 450px;
+            }
+            h1 { 
+                color: #333; 
+                margin-bottom: 0.5rem; 
+                font-size: 1.8rem;
+                text-align: center;
+            }
+            .subtitle {
+                color: #666;
+                text-align: center;
+                margin-bottom: 1.5rem;
+                font-size: 0.95rem;
+            }
+            .info {
+                background: #e3f2fd;
+                padding: 1rem;
+                border-radius: 8px;
+                margin-bottom: 1.5rem;
+                border-left: 4px solid #2196f3;
+                font-size: 0.9rem;
+                color: #1565c0;
+            }
+            .error {
+                background: #ffebee;
+                color: #c62828;
+                padding: 0.75rem;
+                border-radius: 6px;
+                margin-bottom: 1rem;
+                border-left: 4px solid #c62828;
+                font-size: 0.9rem;
+            }
+            .form-group {
+                margin-bottom: 1rem;
+            }
+            label {
+                display: block;
+                margin-bottom: 0.5rem;
+                color: #333;
+                font-weight: 500;
+                font-size: 0.95rem;
+            }
+            input {
+                width: 100%;
+                padding: 0.75rem;
+                border: 1px solid #ddd;
+                border-radius: 6px;
+                font-size: 1rem;
+                transition: border-color 0.2s, box-shadow 0.2s;
+            }
+            input:focus {
+                outline: none;
+                border-color: #667eea;
+                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            }
+            button {
+                width: 100%;
+                padding: 0.85rem;
+                background: #667eea;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background 0.2s, transform 0.1s;
+                margin-top: 0.5rem;
+            }
+            button:hover { 
+                background: #5568d3;
+            }
+            button:active {
+                transform: scale(0.98);
+            }
+            .enrollment-box {
+                background: #f0f4ff;
+                padding: 1rem;
+                border-radius: 8px;
+                margin-bottom: 1.5rem;
+                border-left: 4px solid #667eea;
+                font-size: 0.85rem;
+            }
+            .enrollment-box h3 {
+                margin-bottom: 0.75rem;
+                color: #333;
+                font-size: 0.95rem;
+            }
+            .secret-display {
+                background: white;
+                padding: 0.5rem;
+                border-radius: 4px;
+                font-family: monospace;
+                font-size: 0.9rem;
+                word-break: break-all;
+                margin: 0.5rem 0;
+                border: 1px solid #ddd;
+                user-select: all;
+            }
+            .otpauth-uri {
+                background: white;
+                padding: 0.5rem;
+                border-radius: 4px;
+                font-family: monospace;
+                font-size: 0.7rem;
+                word-break: break-all;
+                margin: 0.5rem 0;
+                border: 1px solid #ddd;
+                max-height: 60px;
+                overflow-y: auto;
+                user-select: all;
+            }
+            .hint {
+                color: #666;
+                font-size: 0.8rem;
+                margin-top: 0.5rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1><?php echo $is_enrollment ? '🔐 Configurar MFA' : '🛡️ Verificação MFA'; ?></h1>
+            <p class="subtitle"><?php echo htmlspecialchars($client_name); ?> — <?php echo htmlspecialchars($username); ?></p>
+
+            <?php if ($is_enrollment): ?>
+                <div class="info">
+                    <strong>Passo 1:</strong> Adicione este segredo no seu app autenticador (Google Authenticator, Authy, etc.).
+                </div>
+
+                <div class="enrollment-box">
+                    <h3>📱 Segredo Base32 (entrada manual):</h3>
+                    <div class="secret-display"><?php echo htmlspecialchars($pending_secret); ?></div>
+                    
+                    <h3 style="margin-top: 1rem;">🔗 OTPAuth URI (alternativa):</h3>
+                    <div class="otpauth-uri"><?php echo htmlspecialchars($otpauth_uri); ?></div>
+                    <p class="hint">Copie e cole no navegador do celular ou escaneie com o app.</p>
+                </div>
+
+                <div class="info">
+                    <strong>Passo 2:</strong> Informe o código de 6 dígitos exibido no app para confirmar.
+                </div>
+            <?php else: ?>
+                <div class="info">
+                    Digite o código de 6 dígitos exibido no seu app autenticador.
+                </div>
+            <?php endif; ?>
+
+            <?php if (!empty($error)): ?>
+                <div class="error">
+                    <strong>⚠️ Erro:</strong> <?php echo htmlspecialchars($error); ?>
+                </div>
+            <?php endif; ?>
+
+            <form method="POST" action="">
+                <?php foreach ($authParams as $param_name => $param_value): ?>
+                    <?php if ($param_value !== null && $param_value !== ''): ?>
+                        <input type="hidden" name="<?php echo htmlspecialchars($param_name); ?>" value="<?php echo htmlspecialchars((string) $param_value); ?>">
+                    <?php endif; ?>
+                <?php endforeach; ?>
+
+                <div class="form-group">
+                    <label for="totp_code">🔑 Código TOTP:</label>
+                    <input 
+                        type="text" 
+                        id="totp_code" 
+                        name="totp_code" 
+                        placeholder="000000"
+                        maxlength="6"
+                        pattern="[0-9]{6}"
+                        inputmode="numeric"
+                        autocomplete="one-time-code"
+                        required 
+                        autofocus
+                    >
+                </div>
+
+                <button type="submit">✓ Verificar</button>
+            </form>
         </div>
     </body>
     </html>
@@ -2654,6 +3104,22 @@ function handleDevice() {
 
         $username = $_SESSION['oauth_authenticated_user'] ?? null;
 
+        // Se há código TOTP pendente, processar antes de consentimento
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['totp_code']) && !empty($_SESSION['mfa_pending_user'])) {
+            $result = processTotpSubmission(trim((string) $_POST['totp_code']));
+            if ($result['fatal']) {
+                unset($_SESSION['mfa_pending_user'], $_SESSION['mfa_pending_secret'], $_SESSION['mfa_attempts']);
+                return showDeviceLoginForm($device_data, $result['error'] ?: 'Muitas tentativas TOTP. Faça login novamente.');
+            }
+            if ($result['success']) {
+                $username = $result['user'];
+                // Após MFA OK, mostrar consentimento
+                return showDeviceConsentForm($device_data, $username);
+            } else {
+                return showTotpFormForDevice($device_data, $result['user'], $result['secret'], $result['is_enrollment'], $result['error']);
+            }
+        }
+
         if ($consent === '0') {
             // Negado
             $storage['device_codes'][$device_code_key]['status'] = 'denied';
@@ -2677,6 +3143,22 @@ function handleDevice() {
 
             if ($username_input !== '' && $password !== '' && isset($GLOBALS['users'][$username_input])) {
                 if (hash_equals($GLOBALS['users'][$username_input]['password'], $password)) {
+                    $user_data = $GLOBALS['users'][$username_input];
+                    if (!empty($user_data['mfa'])) {
+                        $storage = loadStorage();
+                        $stored_secret = $storage['totp_secrets'][$username_input]['secret'] ?? null;
+                        if ($stored_secret === null) {
+                            $pending_secret = generateTotpSecret();
+                            $_SESSION['mfa_pending_user'] = $username_input;
+                            $_SESSION['mfa_pending_secret'] = $pending_secret;
+                            $_SESSION['mfa_attempts'] = 0;
+                            return showTotpFormForDevice($device_data, $username_input, $pending_secret, true);
+                        } else {
+                            $_SESSION['mfa_pending_user'] = $username_input;
+                            $_SESSION['mfa_attempts'] = 0;
+                            return showTotpFormForDevice($device_data, $username_input, null, false);
+                        }
+                    }
                     $_SESSION['oauth_authenticated_user'] = $username_input;
                     $username = $username_input;
                     return showDeviceConsentForm($device_data, $username);
@@ -2738,44 +3220,47 @@ function htmlResponse($content, $statusCode = 200) {
 }
 
 // ============================================================================
-// ROTEADOR
+// ROTEADOR (apenas em ambiente web; CLI usa os helpers diretamente)
 // ============================================================================
 
-$action = $_GET['action'] ?? $_POST['action'] ?? 'debug';
+if (PHP_SAPI !== 'cli') {
+    $action = $_GET['action'] ?? $_POST['action'] ?? 'debug';
 
-switch ($action) {
-    case 'authorize':
-        handleAuthorize();
-        break;
-    case 'token':
-        handleToken();
-        break;
-    case 'userinfo':
-        handleUserInfo();
-        break;
-    case 'revoke':
-        handleRevoke();
-        break;
-    case 'introspect':
-        handleIntrospect();
-        break;
-    case 'well-known':
-        handleWellKnown();
-        break;
-    case 'device_code':
-        handleDeviceAuthorization();
-        break;
-    case 'device':
-        handleDevice();
-        break;
-    case 'clear_storage':
-        handleClearStorage();
-        break;
-    case 'debug':
-    default:
-        handleDebug();
-        break;
+    switch ($action) {
+        case 'authorize':
+            handleAuthorize();
+            break;
+        case 'token':
+            handleToken();
+            break;
+        case 'userinfo':
+            handleUserInfo();
+            break;
+        case 'revoke':
+            handleRevoke();
+            break;
+        case 'introspect':
+            handleIntrospect();
+            break;
+        case 'well-known':
+            handleWellKnown();
+            break;
+        case 'device_code':
+            handleDeviceAuthorization();
+            break;
+        case 'device':
+            handleDevice();
+            break;
+        case 'clear_storage':
+            handleClearStorage();
+            break;
+        case 'debug':
+        default:
+            handleDebug();
+            break;
+    }
 }
+
 // Device Flow Forms
 function showDeviceCodeForm() {
     ?>
@@ -2809,6 +3294,78 @@ function showDeviceCodeForm() {
                     <input type="text" id="user_code" name="user_code" placeholder="XXXX-XXXX" maxlength="9" required autofocus>
                 </div>
                 <button type="submit">Continuar</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+function showTotpFormForDevice($device_data, $username, $pending_secret = null, $is_enrollment = false, $error = '') {
+    global $clients;
+    $client_name = $clients[$device_data['client_id']]['client_name'] ?? $device_data['client_id'];
+    $otpauth_uri = $is_enrollment && $pending_secret !== null
+        ? totpOtpauthUri($username, $pending_secret)
+        : null;
+    ?>
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Device Authorization - MFA</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 1rem; }
+            .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); width: 100%; max-width: 450px; }
+            h1 { color: #333; margin-bottom: 0.5rem; font-size: 1.8rem; text-align: center; }
+            .subtitle { color: #666; text-align: center; margin-bottom: 1.5rem; font-size: 0.95rem; }
+            .info { background: #e3f2fd; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; border-left: 4px solid #2196f3; font-size: 0.9rem; color: #1565c0; }
+            .error { background: #ffebee; color: #c62828; padding: 0.75rem; border-radius: 6px; margin-bottom: 1rem; border-left: 4px solid #c62828; font-size: 0.9rem; }
+            .form-group { margin-bottom: 1rem; }
+            label { display: block; margin-bottom: 0.5rem; color: #333; font-weight: 500; font-size: 0.95rem; }
+            input { width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 6px; font-size: 1rem; }
+            button { width: 100%; padding: 0.85rem; background: #667eea; color: white; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
+            button:hover { background: #5568d3; }
+            .enrollment-box { background: #f0f4ff; padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem; border-left: 4px solid #667eea; font-size: 0.85rem; }
+            .enrollment-box h3 { margin-bottom: 0.75rem; color: #333; font-size: 0.95rem; }
+            .secret-display { background: white; padding: 0.5rem; border-radius: 4px; font-family: monospace; font-size: 0.9rem; word-break: break-all; margin: 0.5rem 0; border: 1px solid #ddd; user-select: all; }
+            .otpauth-uri { background: white; padding: 0.5rem; border-radius: 4px; font-family: monospace; font-size: 0.7rem; word-break: break-all; margin: 0.5rem 0; border: 1px solid #ddd; max-height: 60px; overflow-y: auto; user-select: all; }
+            .hint { color: #666; font-size: 0.8rem; margin-top: 0.5rem; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1><?php echo $is_enrollment ? '🔐 Configurar MFA' : '🛡️ Verificação MFA'; ?></h1>
+            <p class="subtitle">Device Flow - <?php echo htmlspecialchars($client_name); ?> — <?php echo htmlspecialchars($username); ?></p>
+
+            <?php if ($is_enrollment): ?>
+                <div class="info"><strong>Passo 1:</strong> Adicione este segredo no seu app autenticador.</div>
+                <div class="enrollment-box">
+                    <h3>📱 Segredo Base32 (entrada manual):</h3>
+                    <div class="secret-display"><?php echo htmlspecialchars($pending_secret); ?></div>
+                    <h3 style="margin-top: 1rem;">🔗 OTPAuth URI (alternativa):</h3>
+                    <div class="otpauth-uri"><?php echo htmlspecialchars($otpauth_uri); ?></div>
+                    <p class="hint">Copie e cole no navegador do celular ou escaneie com o app.</p>
+                </div>
+                <div class="info"><strong>Passo 2:</strong> Informe o código de 6 dígitos exibido no app para confirmar.</div>
+            <?php else: ?>
+                <div class="info">Digite o código de 6 dígitos exibido no seu app autenticador.</div>
+            <?php endif; ?>
+
+            <?php if (!empty($error)): ?>
+                <div class="error"><strong>⚠️ Erro:</strong> <?php echo htmlspecialchars($error); ?></div>
+            <?php endif; ?>
+
+            <form method="POST" action="">
+                <input type="hidden" name="action" value="device">
+                <input type="hidden" name="user_code" value="<?php echo htmlspecialchars($device_data['user_code']); ?>">
+                <div class="form-group">
+                    <label for="totp_code">🔑 Código TOTP:</label>
+                    <input type="text" id="totp_code" name="totp_code" placeholder="000000" maxlength="6" pattern="[0-9]{6}" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+                </div>
+                <button type="submit">✓ Verificar</button>
             </form>
         </div>
     </body>
