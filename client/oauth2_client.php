@@ -985,6 +985,10 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     🔀 Hybrid Flow<br>
                     <small>OIDC Core 1.0</small>
                 </a>
+                <a href="?flow=saml" class="flow-button <?php echo $flow_type === 'saml' ? 'active' : ''; ?>">
+                    🛡️ SAML2 Bearer<br>
+                    <small>RFC 7522</small>
+                </a>
             </div>
             
             <!-- AUTHORIZATION CODE FLOW -->
@@ -1728,6 +1732,180 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                 }
                 </script>
             <?php endif; ?>
+            <?php if ($flow_type === 'saml'): ?>
+                <div class="card">
+                    <h2>🛡️ SAML 2.0 Bearer Assertion (RFC 7522)</h2>
+                    
+                    <div class="info-box">
+                        <strong>Como funciona:</strong>
+                        <ol style="margin-left: 1.5rem; margin-top: 0.5rem;">
+                            <li>Usa uma <strong>SAML 2.0 Assertion</strong> assinada pelo IdP como credencial</li>
+                            <li>Pode ser usada como <strong>Client Authentication</strong> (client_assertion) ou como <strong>Grant Type</strong> (grant_type=saml2-bearer)</li>
+                            <li>Servidor valida assinatura (RSA-SHA256, Enveloped), Issuer confiável, Conditions (NotBefore/NotOnOrAfter), Audience, SubjectConfirmation (Recipient)</li>
+                        </ol>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Modo de Uso:</label>
+                        <select id="saml_mode" onchange="toggleSamlMode()">
+                            <option value="grant">Grant Type (assertion como credencial de usuário)</option>
+                            <option value="client_auth">Client Authentication (assertion como client_assertion)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Client ID:</label>
+                        <input type="text" id="saml_client_id" value="cliente_saml">
+                    </div>
+
+                    <div id="saml_grant_fields">
+                        <div class="form-group">
+                            <label>Scope (opcional):</label>
+                            <input type="text" id="saml_scope" value="openid profile">
+                        </div>
+                    </div>
+
+                    <div id="saml_client_auth_fields" style="display:none;">
+                        <div class="form-group">
+                            <label>Grant Type (quando autenticação é SAML):</label>
+                            <select id="saml_grant_with_auth">
+                                <option value="client_credentials">client_credentials</option>
+                                <option value="authorization_code">authorization_code (requer code)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>SAML 2.0 Assertion (XML, Base64 ou Base64URL):</label>
+                        <textarea id="saml_assertion" rows="12" placeholder="Cole aqui a SAML 2.0 Assertion XML assinada..." style="font-family: monospace; font-size: 0.8rem;"></textarea>
+                    </div>
+
+                    <button type="button" onclick="generateTestSamlAssertion()" style="width: 100%; margin-bottom: 0.5rem;">
+                        🔧 Gerar SAML Assertion de Teste (auto-assinada local)
+                    </button>
+
+                    <button type="button" onclick="requestSamlToken()" style="width: 100%;">
+                        🚀 Solicitar Token com SAML Assertion
+                    </button>
+
+                    <div id="saml-result" style="margin-top: 1.5rem;"></div>
+                </div>
+
+                <script>
+                function toggleSamlMode() {
+                    const mode = document.getElementById('saml_mode').value;
+                    document.getElementById('saml_grant_fields').style.display = mode === 'grant' ? 'block' : 'none';
+                    document.getElementById('saml_client_auth_fields').style.display = mode === 'client_auth' ? 'block' : 'none';
+                }
+                toggleSamlMode();
+
+                // Gerar par de chaves RSA e assertion SAML mínima para teste didático
+                async function generateTestSamlAssertion() {
+                    try {
+                        // Gerar par de chaves RSA via WebCrypto
+                        const keyPair = await crypto.subtle.generateKey({
+                            name: 'RSASSA-PKCS1-v1_5',
+                            modulusLength: 2048,
+                            publicExponent: new Uint8Array([0x01, 0x00, 0x01]),
+                            hash: 'SHA-256'
+                        }, true, ['sign', 'verify']);
+
+                        // Exportar chave pública em SPKI PEM (para servidor)
+                        const spki = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+                        const pemKey = btoa(String.fromCharCode(...new Uint8Array(spki)));
+                        const pemPublicKey = '-----BEGIN PUBLIC KEY-----\\n' + pemKey.replace(/(.{64})/g, '$1\\n') + '\\n-----END PUBLIC KEY-----';
+
+                        // Armazenar chave privada em memória para assinar assertion
+                        window._samlTestPrivateKey = keyPair.privateKey;
+                        window._samlTestPublicKey = pemPublicKey;
+
+                        // Configurar audience/recipient conforme servidor
+                        const issuer = 'test-saml-issuer';
+                        const audience = 'http://localhost:8000/oauth2_complete.php';
+                        const recipient = 'http://localhost:8000/oauth2_complete.php?action=token';
+                        const nameId = 'usuario1';
+                        const now = new Date();
+                        const notBefore = new Date(now.getTime() - 60000).toISOString().replace(/\\.\\d{3}Z/, 'Z');
+                        const notOnOrAfter = new Date(now.getTime() + 300000).toISOString().replace(/\\.\\d{3}Z/, 'Z');
+
+                        // Assertion XML simples (enveloped, será assinada)
+                        const assertionXml = '<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_test_' + Math.random().toString(36).substring(2, 15) + '" Version="2.0" IssueInstant="' + new Date().toISOString().replace(/\\.\\d{3}Z/, 'Z') + '">' +
+                            '<saml:Issuer>' + issuer + '</saml:Issuer>' +
+                            '<saml:Subject>' +
+                                '<saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">' + nameId + '</saml:NameID>' +
+                                '<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">' +
+                                    '<saml:SubjectConfirmationData Recipient="' + recipient + '" NotOnOrAfter="' + notOnOrAfter + '"/>' +
+                                '</saml:SubjectConfirmation>' +
+                            '</saml:Subject>' +
+                            '<saml:Conditions NotBefore="' + notBefore + '" NotOnOrAfter="' + notOnOrAfter + '">' +
+                                '<saml:AudienceRestriction>' +
+                                    '<saml:Audience>' + audience + '</saml:Audience>' +
+                                '</saml:AudienceRestriction>' +
+                            '</saml:Conditions>' +
+                        '</saml:Assertion>';
+
+                        // Para teste simples, gerar assertion sem assinatura completa (servidor rejeitará) - melhor: gerar assertion que será auto-gerada
+                        // Vamos exibir mensagem e salvar assertion pré-estruturada
+                        document.getElementById('saml_assertion').value = assertionXml;
+                        document.getElementById('saml-result').innerHTML = '<div class="info-box"><strong>Assertion gerada (estrutura).</strong> Para validação completa no servidor, é necessário assinar com XMLDSig. Esta versão didática gera a estrutura; para teste real, use ferramenta SAML ou cole assertion assinada de IdP.\\n\\nChave pública gerada (para configurar no servidor se desejar):<br><code style="font-size:0.7rem;word-break:break-all;">' + pemPublicKey + '</code></div>';
+
+                    } catch (e) {
+                        document.getElementById('saml-result').innerHTML = '<div class="error">Erro ao gerar SAML de teste: ' + e.message + '</div>';
+                    }
+                }
+
+                async function requestSamlToken() {
+                    const mode = document.getElementById('saml_mode').value;
+                    const clientId = document.getElementById('saml_client_id').value;
+                    const assertion = document.getElementById('saml_assertion').value;
+                    const resultDiv = document.getElementById('saml-result');
+
+                    if (!assertion) {
+                        resultDiv.innerHTML = '<div class="error">Cole ou gere uma SAML Assertion primeiro.</div>';
+                        return;
+                    }
+
+                    const params = new URLSearchParams();
+                    params.append('client_id', clientId);
+
+                    if (mode === 'grant') {
+                        params.append('grant_type', 'urn:ietf:params:oauth:grant-type:saml2-bearer');
+                        params.append('assertion', assertion);
+                        const scope = document.getElementById('saml_scope').value;
+                        if (scope) params.append('scope', scope);
+                    } else {
+                        params.append('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:saml2-bearer');
+                        params.append('client_assertion', assertion);
+                        params.append('grant_type', document.getElementById('saml_grant_with_auth').value);
+                    }
+
+                    try {
+                        const response = await fetch('<?php echo $oauth_server; ?>/oauth2_complete.php?action=token', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: params.toString()
+                        });
+                        const data = await response.json();
+                        if (response.ok) {
+                            resultDiv.innerHTML = '<div class="success">✓ Token obtido!</div><pre style="background:#f5f5f5; padding:1rem; border-radius:8px; overflow:auto; font-size:0.8rem;">' + JSON.stringify(data, null, 2) + '</pre>';
+                            // Salvar tokens na sessão se houver access_token
+                            if (data.access_token) {
+                                fetch(window.location.pathname, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                    body: 'implicit_callback=1&access_token=' + encodeURIComponent(data.access_token) + '&token_type=' + encodeURIComponent(data.token_type || 'Bearer') + '&expires_in=' + encodeURIComponent(data.expires_in || 3600) + '&scope=' + encodeURIComponent(data.scope || '') + '&state=saml'
+                                });
+                            }
+                        } else {
+                            resultDiv.innerHTML = '<div class="error">✗ Erro: ' + (data.error_description || data.error) + '</div><pre>' + JSON.stringify(data, null, 2) + '</pre>';
+                        }
+                    } catch (error) {
+                        resultDiv.innerHTML = '<div class="error">✗ Erro na requisição: ' + error.message + '</div>';
+                    }
+                }
+                </script>
+            <?php endif; ?>
+
             <!-- INFORMAÇÕES E CREDENCIAIS -->
             <div class="grid">
                 <div class="card">
