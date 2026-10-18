@@ -28,26 +28,26 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 | **Token Exchange** | RFC 8693 | ✅ Sim | 🏢 **MÉDIO/ENTERPRISE** | Usado em malhas de microsserviços / delegação |
 | **OIDC Hybrid Flow** | OIDC Core 1.0 | ✅ Sim | ⏳ **EM DECLÍNIO** | Pouco usado em novos projetos; superado por Code + PKCE |
 | **SAML 2.0 Assertion** | RFC 7522 | ✅ Sim | 🏛️ **LEGADO CORPORATIVO** | Apenas para migração de SSO corporativo legado |
-| **MFA / TOTP no Login** | RFC 6238 | ❌ **Falta** | 🔥 **PADRÃO UNIVERSAL** | Autenticação do usuário final com segundo fator |
+| **MFA / TOTP no Login** | RFC 6238 | ✅ Sim | 🔥 **PADRÃO UNIVERSAL** | Autenticação do usuário final com segundo fator |
 
 ---
 
 ## 2. Análise Detalhada dos Métodos Faltantes no Mercado
 
 > [!NOTE]
-> Device Authorization Grant (RFC 8628), Token Introspection (RFC 7662), Public Clients (OAuth 2.1), JWT Bearer Assertion (RFC 7523) e Token Exchange (RFC 8693) **já foram implementados** e foram movidos para a seção 3.
+> Device Authorization Grant (RFC 8628), Token Introspection (RFC 7662), Public Clients (OAuth 2.1), JWT Bearer Assertion (RFC 7523), Token Exchange (RFC 8693), OIDC Hybrid Flow, SAML 2.0 Assertion (RFC 7522) e MFA / TOTP (RFC 6238) **já foram implementados** e foram movidos para a seção 3.
 
-### 2.1 MFA / TOTP no Login (RFC 6238)
-* **O que é:** Segundo fator (código de 6 dígitos rotativo) exigido no momento da autenticação do usuário, antes da emissão do authorization code ou do token.
-* **Ainda é utilizado no mercado?** **SIM, PADRÃO UNIVERSAL** — exigido por Google, GitHub, Microsoft e pela maioria das normas de segurança (NIST 800-63B).
-
-### 2.2 OIDC Hybrid Flow (OIDC Core 1.0)
+### 2.1 OIDC Hybrid Flow (OIDC Core 1.0)
 * **O que é:** Variante que retorna code e/ou tokens na primeira chamada de `/authorize` (fragmento ou query).
 * **Ainda é utilizado no mercado?** **EM DECLÍNIO** — superado por Authorization Code + PKCE; mantido apenas por compatibilidade.
 
-### 2.3 SAML 2.0 Assertion (RFC 7522)
+### 2.2 SAML 2.0 Assertion (RFC 7522)
 * **O que é:** Permite autenticação de clientes mediante uma assertion SAML assinada, no lugar de `client_secret`.
 * **Ainda é utilizado no mercado?** **LEGADO CORPORATIVO** — apenas para migração de SSO corporativo antigo.
+
+### 2.3 MFA / TOTP no Login (RFC 6238)
+* **O que é:** Segundo fator (código de 6 dígitos rotativo) exigido no momento da autenticação do usuário, antes da emissão do authorization code ou do token.
+* **Ainda é utilizado no mercado?** **SIM, PADRÃO UNIVERSAL** — exigido por Google, GitHub, Microsoft e pela maioria das normas de segurança (NIST 800-63B).
 
 ---
 
@@ -69,8 +69,11 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 | **Public Clients (PKCE sem secret)** ✅ *novo* | `isPublicClient()` + cliente `spa_publica`; PKCE obrigatório no `/authorize`, `client_secret` dispensado no `/token` | `docs/IMPLEMENTACAO_PUBLIC_CLIENTS.md` |
 | **JWT Bearer Assertion** ✅ *novo* | `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` + `client_assertion` (RFC 7523) | `docs/PLAN_JWT_BEARER_ASSERTION.md` |
 | **Token Exchange** ✅ *novo* | `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` (`subject_token`/`actor_token`, RFC 8693) | `docs/PLAN_TOKEN_EXCHANGE.md` |
+| **OIDC Hybrid Flow** ✅ *novo* | `response_type=code token` / `code id_token` / `code id_token token` no `/authorize` | `docs/PLAN_OIDC_HYBRID_FLOW.md` |
+| **SAML 2.0 Assertion** ✅ *novo* | `grant_type=urn:ietf:params:oauth:grant-type:saml2-bearer` + `assertion` (RFC 7522) | `docs/PLAN_SAML2_ASSERTION.md` |
+| **MFA / TOTP no Login** ✅ *novo* | Segundo fator no `/authorize` e no Device Flow; flag `'mfa' => true` por usuário (RFC 6238) | `docs/PLAN_MFA_TOTP.md` |
 
-O cliente (`client/oauth2_client.php`) possui abas interativas para Authorization Code, Implicit, Password, Client Credentials, **Device Flow**, **JWT Bearer** e **Token Exchange**.
+O cliente (`client/oauth2_client.php`) possui abas interativas para Authorization Code, Implicit, Password, Client Credentials, **Device Flow**, **JWT Bearer**, **Token Exchange**, **Hybrid Flow** e **SAML2 Bearer**. O MFA/TOTP é exigido no login interativo (Authorization Code / Hybrid) e no Device Flow para usuários com a flag `mfa`.
 
 > [!WARNING]
 > ### Alerta sobre Métodos Obsoletos Já Presentes no Código
@@ -91,13 +94,13 @@ flowchart TD
         C3["Token Introspection (RFC 7662) ✅"]
     end
 
-    subgraph Fase2["Fase 2: Métodos Enterprise / Avançados"]
+    subgraph Fase2["Fase 2: Métodos Enterprise / Avançados ✅ Concluída"]
         D["JWT Bearer Assertion (RFC 7523) ✅"]
         D2["Token Exchange (RFC 8693) ✅"]
-        E["MFA / TOTP na Autenticação do Usuário"]
+        E["MFA / TOTP no Login (RFC 6238) ✅"]
     end
 
-    subgraph Fase3["Fase 3: Opcional / Específico"]
+    subgraph Fase3["Fase 3: Opcional / Específico ✅ Concluída"]
         G["OIDC Hybrid Flow ✅ / SAML 2.0 Assertion ✅"]
     end
 
@@ -260,13 +263,22 @@ O `code` gerado continua válido para troca via `grant_type=authorization_code` 
 
 Assertion aceita XML bruto, Base64 ou Base64URL. Chave pública via X.509 (`-----BEGIN CERTIFICATE-----`) ou PEM público (`-----BEGIN PUBLIC KEY-----`).
 
-### 5.8 Componente Pendente: MFA / TOTP no Login (RFC 6238)
+### 5.8 Componente Implementado: MFA / TOTP no Login (RFC 6238) ✅
 
+> Implementado em `server/oauth2_complete.php`: helpers `base32Encode()`/`base32Decode()` (RFC 4648), `generateTotpSecret()` (160 bits), `totpGenerate()` (HMAC-SHA1, 6 dígitos, período 30s), `totpVerify()` (janela ±1 passo, `hash_equals`), `totpOtpauthUri()` e `processTotpSubmission()` (máquina de estados compartilhada). Flag `'mfa' => true` no array `$users` (habilitada para `usuario1`). Formulários `showTotpForm()` (login interativo) e `showTotpFormForDevice()` (Device Flow). Utilitário CLI `server/totp_code.php`. Detalhes em `docs/PLAN_MFA_TOTP.md`.
 
+**Máquina de estados (login interativo `/authorize` e Device Flow):**
+1. Senha válida + usuário com `mfa` → se não há segredo, gera e exibe **enrollment** (segredo Base32 + URI `otpauth://`); se já há segredo, exibe formulário de verificação.
+2. Código TOTP validado com janela de ±1 passo (tolerância de relógio).
+3. **Replay protection:** o contador do período (30s) usado é gravado em `$storage['totp_used']` com TTL de 90s; reutilização é bloqueada.
+4. **Rate limit:** máximo de 5 tentativas; ao exceder, volta ao login de senha.
+5. Sucesso → `$_SESSION['oauth_authenticated_user']` é definido e o fluxo prossegue (consentimento / emissão de token).
 
-* Gerar segredo TOTP por usuário no primeiro login e exibir QR Code (otpauth:// URI).
-* No `handleLogin()` / `handleAuthorize()`, exigir o código de 6 dígitos antes de emitir o authorization code.
-* Cache de códigos usados (janela de 1 passo) para evitar replay.
+**Storage:** `totp_secrets[$username] = ['secret' => '<base32>', 'created_at' => ts]` e `totp_used[$username][$counter] = ts`.
+
+**Escopo:** login interativo do `/authorize` e login do Device Flow. O ROPC (`grant_type=password`) **não** exige TOTP (fora de escopo).
+
+**Teste rápido:** `php server/totp_code.php usuario1` imprime o código TOTP atual (após o enrollment).
 
 ---
 
@@ -297,6 +309,22 @@ Assertion aceita XML bruto, Base64 ou Base64URL. Chave pública via X.509 (`----
    * Audience incorreto retorna `400 invalid_grant`
    * Recipient incorreto retorna `400 invalid_grant`
    * Issuer não confiável retorna `400 invalid_grant`
+   * Assinatura inválida retorna `400 invalid_grant`
+   * Expirada (NotOnOrAfter < agora) retorna `400 invalid_grant`
+   * NotBefore futuro retorna `400 invalid_grant`
+   * Audience incorreto retorna `400 invalid_grant`
+   * Recipient incorreto retorna `400 invalid_grant`
+   * Issuer não confiável retorna `400 invalid_grant`
+
+8. **MFA / TOTP (RFC 6238):**
+   * `usuario2` (sem flag `mfa`) segue o fluxo normal, sem TOTP
+   * `usuario1` no 1º login exibe enrollment (segredo Base32 + URI `otpauth://`); código válido persiste o segredo e conclui o login
+   * Login subsequente de `usuario1` exige TOTP (sem enrollment)
+   * Código inválido é rejeitado; reutilização do mesmo código (mesmo período) é bloqueada
+   * Após 5 tentativas inválidas, volta ao login de senha
+   * `prompt=none` com sessão em MFA pendente retorna `interaction_required`
+   * Device Flow com `usuario1` exige TOTP (enrollment + verificação) antes do consentimento
+   * `totpGenerate()` confere com implementação de referência (RFC 6238) em timestamps fixos
    * Algoritmo não suportado retorna `400 invalid_grant`
    * XML mal formado retorna `400 invalid_grant`
    * Sem assinatura retorna `400 invalid_grant`
@@ -311,5 +339,6 @@ Assertion aceita XML bruto, Base64 ou Base64URL. Chave pública via X.509 (`----
 * Testar `?action=introspect` com um token ativo e outro revogado.
 * Abrir a aba **Hybrid Flow**, testar `code token`, `code id_token` (com nonce) e `code id_token token`. Verificar que `code` é trocado automaticamente e tokens aparecem na sessão.
 * Abrir a aba **SAML2 Bearer**, gerar SAML de teste (didático) ou colar assertion assinada real, testar modos Grant Type e Client Authentication.
+* **MFA / TOTP:** fazer login com `usuario1`/`senha123` no `/authorize`; na primeira vez, configurar o segredo no app autenticador (ou usar `php server/totp_code.php usuario1`) e informar o código. Repetir o login para validar a verificação. Testar também no Device Flow.
 * Testar o cliente público `spa_publica` (fluxo Authorization Code com PKCE, sem `client_secret`).
 
