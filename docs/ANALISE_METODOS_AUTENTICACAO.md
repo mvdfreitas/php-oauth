@@ -27,7 +27,7 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 | **JWT Bearer Assertion** | RFC 7523 | ✅ Sim | 💼 **MUITO UTILIZADO (Enterprise)** | Padrão de Service Accounts (Google Cloud, Salesforce) |
 | **Token Exchange** | RFC 8693 | ✅ Sim | 🏢 **MÉDIO/ENTERPRISE** | Usado em malhas de microsserviços / delegação |
 | **OIDC Hybrid Flow** | OIDC Core 1.0 | ✅ Sim | ⏳ **EM DECLÍNIO** | Pouco usado em novos projetos; superado por Code + PKCE |
-| **SAML 2.0 Assertion** | RFC 7522 | ❌ **Falta** | 🏛️ **LEGADO CORPORATIVO** | Apenas para migração de SSO corporativo legado |
+| **SAML 2.0 Assertion** | RFC 7522 | ✅ Sim | 🏛️ **LEGADO CORPORATIVO** | Apenas para migração de SSO corporativo legado |
 | **MFA / TOTP no Login** | RFC 6238 | ❌ **Falta** | 🔥 **PADRÃO UNIVERSAL** | Autenticação do usuário final com segundo fator |
 
 ---
@@ -98,7 +98,7 @@ flowchart TD
     end
 
     subgraph Fase3["Fase 3: Opcional / Específico"]
-        G["OIDC Hybrid Flow ✅ / SAML 2.0 (legado)"]
+        G["OIDC Hybrid Flow ✅ / SAML 2.0 Assertion ✅"]
     end
 
     Fase1 --> Fase2 --> Fase3
@@ -248,7 +248,20 @@ O `code` gerado continua válido para troca via `grant_type=authorization_code` 
 
 ---
 
-### 5.7 Componente Pendente: MFA / TOTP no Login (RFC 6238)
+### 5.7 Componente Implementado: SAML 2.0 Assertion (RFC 7522) ✅
+
+> Implementado em `server/oauth2_complete.php`: helpers `samlDecodeAssertion()`, `parseSamlAssertion()`, `validateSamlSignature()` (Enveloped RSA-SHA256 C14N), `validateSamlConditions()`, `validateSamlSubjectConfirmation()`, `validateSamlAssertion()` (validação completa RFC 7522), `extractPublicKeyFromCert()`. Grant `urn:ietf:params:oauth:grant-type:saml2-bearer` + client authentication via `client_assertion_type=saml2-bearer` em `handleToken()`. Cliente exemplo `cliente_saml` com `saml_trust` (issuers, audience, keys, clock_skew). Aba "🛡️ SAML2 Bearer" no `client/oauth2_client.php`. Detalhes em `docs/PLAN_SAML2_ASSERTION.md`.
+
+**Validações RFC 7522:** Issuer confiável → Assinatura (RSA-SHA256, Enveloped, C14N) → Conditions (NotBefore/NotOnOrAfter + clock skew) → AudienceRestriction → SubjectConfirmation Bearer (Recipient = token endpoint, NotOnOrAfter) → Subject/NameID extraído para mapear usuário.
+
+**Perfis suportados:**
+- **Grant Type:** `grant_type=urn:ietf:params:oauth:grant-type:saml2-bearer&assertion=<SAML>`
+- **Client Authentication:** `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:saml2-bearer&client_assertion=<SAML>`
+
+Assertion aceita XML bruto, Base64 ou Base64URL. Chave pública via X.509 (`-----BEGIN CERTIFICATE-----`) ou PEM público (`-----BEGIN PUBLIC KEY-----`).
+
+### 5.8 Componente Pendente: MFA / TOTP no Login (RFC 6238)
+
 
 
 * Gerar segredo TOTP por usuário no primeiro login e exibir QR Code (otpauth:// URI).
@@ -276,7 +289,19 @@ O `code` gerado continua válido para troca via `grant_type=authorization_code` 
    * `code id_token` sem `nonce` retorna `error=invalid_request`
    * `code` gerado em híbrido pode ser trocado com sucesso no token endpoint
 
-7. **MFA / TOTP:**
+7. **SAML 2.0 Assertion (RFC 7522):**
+   * Assertion válida (assinada, prazos OK, Recipient/Audience OK) retorna 200 + access_token
+   * Assinatura inválida retorna `400 invalid_grant`
+   * Expirada (NotOnOrAfter < agora) retorna `400 invalid_grant`
+   * NotBefore futuro retorna `400 invalid_grant`
+   * Audience incorreto retorna `400 invalid_grant`
+   * Recipient incorreto retorna `400 invalid_grant`
+   * Issuer não confiável retorna `400 invalid_grant`
+   * Algoritmo não suportado retorna `400 invalid_grant`
+   * XML mal formado retorna `400 invalid_grant`
+   * Sem assinatura retorna `400 invalid_grant`
+
+8. **MFA / TOTP:**
    * Login com código TOTP válido aprova; código inválido/expirado é rejeitado; reutilização do mesmo código é bloqueada.
 
 ### 6.2 Testes Manuais
@@ -285,5 +310,6 @@ O `code` gerado continua válido para troca via `grant_type=authorization_code` 
 * Abrir a aba **Token Exchange**, colar um `access_token` obtido em outro flow, informar um `scope` menor (ex.: `openid`) e solicitar o token.
 * Testar `?action=introspect` com um token ativo e outro revogado.
 * Abrir a aba **Hybrid Flow**, testar `code token`, `code id_token` (com nonce) e `code id_token token`. Verificar que `code` é trocado automaticamente e tokens aparecem na sessão.
+* Abrir a aba **SAML2 Bearer**, gerar SAML de teste (didático) ou colar assertion assinada real, testar modos Grant Type e Client Authentication.
 * Testar o cliente público `spa_publica` (fluxo Authorization Code com PKCE, sem `client_secret`).
 

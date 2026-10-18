@@ -94,6 +94,26 @@ $clients = [
         'grant_types' => ['authorization_code', 'refresh_token'],
         'token_endpoint_auth_method' => 'none',
     ],
+    'cliente_saml' => [
+        'client_id' => 'cliente_saml',
+        'client_secret' => null,
+        'client_name' => 'Cliente SAML 2.0 Bearer',
+        'redirect_uris' => [],
+        'response_types' => [],
+        'grant_types' => ['urn:ietf:params:oauth:grant-type:saml2-bearer'],
+        'allowed_scopes' => ['openid', 'profile', 'email'],
+        'token_endpoint_auth_method' => 'client_secret_basic',
+        'saml_trust' => [
+            'issuers' => ['test-saml-issuer', 'https://idp.example.com/issuer'],
+            'audience' => ['http://localhost:8000/oauth2_complete.php', 'cliente_saml'],
+            'keys' => [
+                // Chave pública de teste será preenchida dinamicamente em ambiente de teste
+                'public_key_pem' => null,
+                'x509' => null,
+            ],
+            'clock_skew' => 60,
+        ],
+    ],
 ];
 
 // Escopos disponíveis e suas claims
@@ -524,6 +544,380 @@ function parseScopes($scope_string) {
     if (!$scope_string) return [];
     return array_filter(explode(' ', trim($scope_string)));
 }
+
+// ============================================================================
+// SAML 2.0 ASSERTION (RFC 7522) — helpers
+// ============================================================================
+
+/**
+ * Tenta decodificar uma SAML Assertion: XML bruto → Base64 → Base64URL.
+ * Retorna XML string ou false se não conseguir decodificar.
+ */
+function samlDecodeAssertion(string $assertion): ?string {
+    // Se já parece XML
+    $trimmed = trim($assertion);
+    if (strpos($trimmed, '<?xml') === 0 || strpos($trimmed, '<saml') === 0 || strpos($trimmed, '<samlp') === 0) {
+        return $assertion;
+    }
+    
+    // Tenta Base64 padrão
+    $decoded = base64_decode($assertion, true);
+    if ($decoded !== false && (strpos($decoded, '<?xml') === 0 || strpos($decoded, '<saml') === 0)) {
+        return $decoded;
+    }
+    
+    // Tenta Base64URL
+    $padded = $assertion;
+    $padding = strlen($padded) % 4;
+    if ($padding) {
+        $padded .= str_repeat('=', 4 - $padding);
+    }
+    $decoded = base64_decode(strtr($padded, '-_', '+/'), true);
+    if ($decoded !== false && (strpos($decoded, '<?xml') === 0 || strpos($decoded, '<saml') === 0)) {
+        return $decoded;
+    }
+    
+    return null;
+}
+
+/**
+ * Extrai a chave pública PEM de um certificado X.509.
+ */
+function extractPublicKeyFromCert(string $certPem): ?string {
+    $cert = openssl_x509_read($certPem);
+    if (!$cert) {
+        return null;
+    }
+    $key = openssl_pkey_get_public($cert);
+    if (!$key) {
+        return null;
+    }
+    $details = openssl_pkey_get_details($key);
+    return $details['key'] ?? null;
+}
+
+/**
+ * Valida a assinatura XMLDSig de uma Assertion SAML (enveloped, RSA-SHA256, C14N).
+ * Suporta subset comum. Retorna ['valid' => bool, 'error' => string].
+ */
+function validateSamlSignature(DOMDocument $doc, string $publicKeyPem): array {
+    $signatureNodes = $doc->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'Signature');
+    if ($signatureNodes->length === 0) {
+        return ['valid' => false, 'error' => 'Assinatura não encontrada'];
+    }
+    
+    $signature = $signatureNodes->item(0);
+    $signedInfo = $signature->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'SignedInfo');
+    if ($signedInfo->length === 0) {
+        return ['valid' => false, 'error' => 'SignedInfo não encontrado'];
+    }
+    $signedInfoNode = $signedInfo->item(0);
+    
+    // Extrair CanonicalizationMethod e SignatureMethod
+    $canonMethod = $signedInfoNode->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'CanonicalizationMethod');
+    $sigMethod = $signedInfoNode->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'SignatureMethod');
+    
+    if ($canonMethod->length === 0 || $sigMethod->length === 0) {
+        return ['valid' => false, 'error' => 'CanonicalizationMethod ou SignatureMethod ausente'];
+    }
+    
+    $canonAlgorithm = $canonMethod->item(0)->getAttribute('Algorithm');
+    $sigAlgorithm = $sigMethod->item(0)->getAttribute('Algorithm');
+    
+    // Apenas RSA-SHA256 e C14N padrão
+    if ($sigAlgorithm !== 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256') {
+        return ['valid' => false, 'error' => 'Algoritmo de assinatura não suportado: ' . $sigAlgorithm];
+    }
+    if (!in_array($canonAlgorithm, ['http://www.w3.org/TR/2001/REC-xml-c14n-20010315', 'http://www.w3.org/2001/10/xml-exc-c14n#'], true)) {
+        return ['valid' => false, 'error' => 'Algoritmo de canonicalização não suportado: ' . $canonAlgorithm];
+    }
+    
+    // Extrair SignatureValue (Base64)
+    $sigValueNodes = $signature->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'SignatureValue');
+    if ($sigValueNodes->length === 0) {
+        return ['valid' => false, 'error' => 'SignatureValue ausente'];
+    }
+    $signatureValueB64 = trim($sigValueNodes->item(0)->textContent);
+    $signatureBytes = base64_decode($signatureValueB64, true);
+    if ($signatureBytes === false) {
+        return ['valid' => false, 'error' => 'SignatureValue Base64 inválido'];
+    }
+    
+    // Canonicalizar SignedInfo
+    $signedInfoC14N = $signedInfoNode->C14N();
+    
+    // Verificar assinatura
+    $ok = openssl_verify($signedInfoC14N, $signatureBytes, $publicKeyPem, OPENSSL_ALGO_SHA256);
+    if ($ok !== 1) {
+        return ['valid' => false, 'error' => 'Assinatura inválida'];
+    }
+    
+    // Verificar Digest de Reference (enveloped)
+    $references = $signature->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'Reference');
+    if ($references->length === 0) {
+        return ['valid' => false, 'error' => 'Reference ausente'];
+    }
+    
+    foreach ($references as $ref) {
+        $refURI = $ref->getAttribute('URI');
+        // URI vazio ou "#" indica o documento raiz (enveloped)
+        if ($refURI !== '' && $refURI !== '#') {
+            return ['valid' => false, 'error' => 'Reference com URI não suportado: ' . $refURI];
+        }
+        
+        $transforms = $ref->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'Transform');
+        $hasEnveloped = false;
+        foreach ($transforms as $tr) {
+            if ($tr->getAttribute('Algorithm') === 'http://www.w3.org/2000/09/xmldsig#enveloped-signature') {
+                $hasEnveloped = true;
+                break;
+            }
+        }
+        if (!$hasEnveloped) {
+            return ['valid' => false, 'error' => 'Transform enveloped-signature não encontrado'];
+        }
+        
+        $digestMethod = $ref->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'DigestMethod');
+        if ($digestMethod->length === 0 || $digestMethod->item(0)->getAttribute('Algorithm') !== 'http://www.w3.org/2001/04/xmlenc#sha256') {
+            return ['valid' => false, 'error' => 'DigestMethod SHA256 esperado'];
+        }
+        
+        $digestValue = $ref->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'DigestValue');
+        if ($digestValue->length === 0) {
+            return ['valid' => false, 'error' => 'DigestValue ausente'];
+        }
+        $expectedDigest = trim($digestValue->item(0)->textContent);
+        
+        // Remover elemento Signature e canonicalizar (enveloped transform)
+        $clone = $doc->cloneNode(true);
+        $sigNodesClone = $clone->getElementsByTagNameNS('http://www.w3.org/2000/09/xmldsig#', 'Signature');
+        if ($sigNodesClone->length > 0) {
+            $sigClone = $sigNodesClone->item(0);
+            $sigClone->parentNode->removeChild($sigClone);
+        }
+        $c14nContent = $clone->C14N();
+        $actualDigest = base64_encode(hash('sha256', $c14nContent, true));
+        
+        if (!hash_equals($expectedDigest, $actualDigest)) {
+            return ['valid' => false, 'error' => 'DigestValue inválido'];
+        }
+    }
+    
+    return ['valid' => true, 'error' => ''];
+}
+
+/**
+ * Valida Conditions (NotBefore/NotOnOrAfter) e AudienceRestriction.
+ */
+function validateSamlConditions(array $data, array $trustConfig, string $expectedAudience): array {
+    $clockSkew = $trustConfig['clock_skew'] ?? 60;
+    $now = time();
+    
+    $notBefore = $data['conditions']['not_before'] ?? null;
+    $notOnOrAfter = $data['conditions']['not_on_or_after'] ?? null;
+    
+    if ($notBefore !== null && $now < strtotime($notBefore) - $clockSkew) {
+        return ['valid' => false, 'error' => 'Condição NotBefore ainda não atingida'];
+    }
+    if ($notOnOrAfter !== null && $now > strtotime($notOnOrAfter) + $clockSkew) {
+        return ['valid' => false, 'error' => 'Condição NotOnOrAfter expirada'];
+    }
+    
+    // Audience
+    $audiences = $data['conditions']['audiences'] ?? [];
+    if (count($audiences) > 0) {
+        $expected = $expectedAudience;
+        if (!in_array($expected, $audiences, true)) {
+            // Também aceitar client_id se configurado
+            $allowedAud = $trustConfig['audience'] ?? [];
+            $found = false;
+            foreach ($allowedAud as $aud) {
+                if (in_array($aud, $audiences, true)) {
+                    $found = true;
+                    break;
+                }
+            }
+            if (!$found) {
+                return ['valid' => false, 'error' => 'Audience não corresponde'];
+            }
+        }
+    }
+    
+    return ['valid' => true, 'error' => ''];
+}
+
+/**
+ * Valida SubjectConfirmation (Bearer: Recipient, NotOnOrAfter).
+ */
+function validateSamlSubjectConfirmation(array $data, string $recipient): array {
+    $clockSkew = 60;
+    $now = time();
+    
+    $confirmation = $data['subject']['confirmation'] ?? null;
+    if ($confirmation === null || $confirmation['method'] !== 'urn:oasis:names:tc:SAML:2.0:cm:bearer') {
+        return ['valid' => false, 'error' => 'SubjectConfirmation Bearer não encontrado'];
+    }
+    
+    $notOnOrAfter = $confirmation['not_on_or_after'] ?? null;
+    if ($notOnOrAfter !== null && $now > strtotime($notOnOrAfter) + $clockSkew) {
+        return ['valid' => false, 'error' => 'SubjectConfirmation NotOnOrAfter expirado'];
+    }
+    
+    $recipients = $confirmation['recipients'] ?? [];
+    if (count($recipients) > 0 && !in_array($recipient, $recipients, true)) {
+        return ['valid' => false, 'error' => 'Recipient do SubjectConfirmation não corresponde'];
+    }
+    
+    return ['valid' => true, 'error' => ''];
+}
+
+/**
+ * Parse SAML 2.0 Assertion em DOMDocument.
+ * Retorna ['valid'=>bool, 'error'=>string, 'data'=>array].
+ */
+function parseSamlAssertion(string $xml): array {
+    if (strlen($xml) > 262144) { // 256KB
+        return ['valid' => false, 'error' => 'Assertion muito grande', 'data' => []];
+    }
+    
+    $doc = new DOMDocument();
+    $prev = libxml_disable_entity_loader(true); // evitar XXE
+    $loaded = $doc->loadXML($xml, LIBXML_NONET | LIBXML_NOENT);
+    libxml_disable_entity_loader($prev);
+    
+    if (!$loaded) {
+        return ['valid' => false, 'error' => 'XML mal formado', 'data' => []];
+    }
+    
+    $ns = 'urn:oasis:names:tc:SAML:2.0:assertion';
+    $issuerNodes = $doc->getElementsByTagNameNS($ns, 'Issuer');
+    if ($issuerNodes->length === 0) {
+        return ['valid' => false, 'error' => 'Issuer ausente', 'data' => []];
+    }
+    $issuer = trim($issuerNodes->item(0)->textContent);
+    
+    $conditionsNode = $doc->getElementsByTagNameNS($ns, 'Conditions');
+    $notBefore = $notOnOrAfter = null;
+    $audiences = [];
+    if ($conditionsNode->length > 0) {
+        $conditions = $conditionsNode->item(0);
+        $notBefore = $conditions->getAttribute('NotBefore') ?: null;
+        $notOnOrAfter = $conditions->getAttribute('NotOnOrAfter') ?: null;
+        foreach ($conditions->getElementsByTagNameNS($ns, 'Audience') as $aud) {
+            $audiences[] = trim($aud->textContent);
+        }
+    }
+    
+    $subjectNodes = $doc->getElementsByTagNameNS($ns, 'Subject');
+    if ($subjectNodes->length === 0) {
+        return ['valid' => false, 'error' => 'Subject ausente', 'data' => []];
+    }
+    $subject = $subjectNodes->item(0);
+    
+    $nameIdNodes = $subject->getElementsByTagNameNS($ns, 'NameID');
+    $nameId = $nameIdNodes->length > 0 ? trim($nameIdNodes->item(0)->textContent) : null;
+    
+    $confirmation = null;
+    $confirmations = $subject->getElementsByTagNameNS($ns, 'SubjectConfirmation');
+    foreach ($confirmations as $conf) {
+        $method = $conf->getAttribute('Method');
+        if ($method === 'urn:oasis:names:tc:SAML:2.0:cm:bearer') {
+            $confirmation = ['method' => $method, 'recipients' => [], 'not_on_or_after' => null];
+            foreach ($conf->getElementsByTagNameNS($ns, 'SubjectConfirmationData') as $scd) {
+                $confirmation['not_on_or_after'] = $scd->getAttribute('NotOnOrAfter') ?: null;
+                $rec = $scd->getAttribute('Recipient');
+                if ($rec) {
+                    $confirmation['recipients'][] = $rec;
+                }
+            }
+            break;
+        }
+    }
+    
+    return [
+        'valid' => true,
+        'error' => '',
+        'data' => [
+            'issuer' => $issuer,
+            'name_id' => $nameId,
+            'conditions' => [
+                'not_before' => $notBefore,
+                'not_on_or_after' => $notOnOrAfter,
+                'audiences' => $audiences,
+            ],
+            'subject' => [
+                'confirmation' => $confirmation,
+            ],
+        ],
+    ];
+}
+
+/**
+ * Validação completa de SAML Assertion conforme RFC 7522.
+ */
+function validateSamlAssertion(string $assertion, array $trustConfig, string $recipient, ?string $clientId = null): array {
+    $xml = samlDecodeAssertion($assertion);
+    if ($xml === null) {
+        return ['valid' => false, 'error' => 'Assertion não pôde ser decodificada (XML/Base64)'];
+    }
+    
+    $parsed = parseSamlAssertion($xml);
+    if (!$parsed['valid']) {
+        return ['valid' => false, 'error' => $parsed['error']];
+    }
+    
+    $data = $parsed['data'];
+    
+    // Issuer confiável
+    $issuers = $trustConfig['issuers'] ?? [];
+    if (!in_array($data['issuer'], $issuers, true)) {
+        return ['valid' => false, 'error' => 'Issuer não confiável: ' . $data['issuer']];
+    }
+    
+    // Validar assinatura
+    $keys = $trustConfig['keys'] ?? [];
+    $publicKey = $keys['public_key_pem'] ?? null;
+    if (!$publicKey && !empty($keys['x509'])) {
+        $publicKey = extractPublicKeyFromCert($keys['x509']);
+    }
+    if (!$publicKey) {
+        return ['valid' => false, 'error' => 'Chave pública de confiança não configurada'];
+    }
+    
+    $doc = new DOMDocument();
+    $prev = libxml_disable_entity_loader(true);
+    $loaded = $doc->loadXML($xml, LIBXML_NONET | LIBXML_NOENT);
+    libxml_disable_entity_loader($prev);
+    if (!$loaded) {
+        return ['valid' => false, 'error' => 'XML mal formado para validação de assinatura'];
+    }
+    
+    $sigResult = validateSamlSignature($doc, $publicKey);
+    if (!$sigResult['valid']) {
+        return ['valid' => false, 'error' => $sigResult['error']];
+    }
+    
+    // Validar condições + audience
+    $expectedAudience = $clientId ?? '';
+    $condResult = validateSamlConditions($data, $trustConfig, $expectedAudience);
+    if (!$condResult['valid']) {
+        return ['valid' => false, 'error' => $condResult['error']];
+    }
+    
+    // Validar SubjectConfirmation (Recipient = token endpoint)
+    $scResult = validateSamlSubjectConfirmation($data, $recipient);
+    if (!$scResult['valid']) {
+        return ['valid' => false, 'error' => $scResult['error']];
+    }
+    
+    return [
+        'valid' => true,
+        'error' => '',
+        'subject' => $data['name_id'],
+        'issuer' => $data['issuer'],
+    ];
+}
+
 
 // ============================================================================
 // TOKEN EXCHANGE (RFC 8693) — helpers
@@ -1215,14 +1609,49 @@ function handleToken() {
         $client_secret = $clients[$client_id]['client_secret'] ?? 'jwt-bearer-auth';
     }
     
+    // SAML 2.0 Client Authentication (RFC 7522 §4.1)
+    if ($client_assertion_type === 'urn:ietf:params:oauth:client-assertion-type:saml2-bearer' && $client_assertion) {
+        // Encontrar cliente pelo issuer da assertion (confiança mútua)
+        $decodedXml = samlDecodeAssertion($client_assertion);
+        $foundClientId = null;
+        if ($decodedXml !== null) {
+            $parsed = parseSamlAssertion($decodedXml);
+            if ($parsed['valid'] && isset($parsed['data']['issuer'])) {
+                foreach ($clients as $cid => $c) {
+                    $trust = $c['saml_trust'] ?? null;
+                    if ($trust && in_array($parsed['data']['issuer'], $trust['issuers'] ?? [], true)) {
+                        $foundClientId = $cid;
+                        break;
+                    }
+                }
+            }
+        }
+        if ($foundClientId === null) {
+            return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client SAML assertion: issuer não confiável ou assertion inválida'], 401);
+        }
+        // Validar assertion completa (assinatura, condições, audience, recipient)
+        $trust = $clients[$foundClientId]['saml_trust'] ?? [];
+        $recipient = $config['base_url'] . '/oauth2_complete.php?action=token';
+        $samlResult = validateSamlAssertion($client_assertion, $trust, $recipient, $foundClientId);
+        if (!$samlResult['valid']) {
+            return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client SAML assertion inválida: ' . $samlResult['error']], 401);
+        }
+        if ($client_id && $client_id !== $foundClientId) {
+            return jsonResponse(['error' => 'invalid_client', 'error_description' => 'client_id não corresponde ao issuer da SAML assertion'], 401);
+        }
+        $client_id = $foundClientId;
+        $client_secret = $clients[$client_id]['client_secret'] ?? 'saml-bearer-auth';
+    }
+    
     // Validações
     if (!$client_id || !isset($clients[$client_id])) {
         return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client ID inválido'], 400);
     }
     // Clientes públicos (PKCE sem secret) não possuem client_secret — a
     // autenticação é feita apenas pelo client_id (RFC 9700). JWT Bearer
-    // Assertion (RFC 7523) também dispensa o client_secret.
+    // Assertion (RFC 7523) e SAML2 Bearer (RFC 7522) também dispensam o client_secret.
     if (!$client_assertion && $grant_type !== 'urn:ietf:params:oauth:grant-type:jwt-bearer'
+        && $grant_type !== 'urn:ietf:params:oauth:grant-type:saml2-bearer'
         && !isPublicClient($client_id) && $clients[$client_id]['client_secret'] !== $client_secret) {
         return jsonResponse(['error' => 'invalid_client', 'error_description' => 'Client secret inválido'], 401);
     }
@@ -1337,6 +1766,41 @@ function handleToken() {
         if (isset($payload['scope'])) {
             $scope = $payload['scope'];
         }
+        if (!$scope) {
+            $scope = 'openid profile';
+        }
+    }
+    // ======================== SAML2 Bearer Assertion Grant (RFC 7522) ========================
+    elseif ($grant_type === 'urn:ietf:params:oauth:grant-type:saml2-bearer') {
+        $assertion = $_POST['assertion'] ?? null;
+        $scope = $_POST['scope'] ?? null;
+
+        if (!$assertion) {
+            return jsonResponse(['error' => 'invalid_request', 'error_description' => 'assertion ausente'], 400);
+        }
+
+        $trust = $clients[$client_id]['saml_trust'] ?? [];
+        if (!$trust) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Cliente não configurado para SAML2 Bearer'], 400);
+        }
+
+        $recipient = $config['base_url'] . '/oauth2_complete.php?action=token';
+        $samlResult = validateSamlAssertion($assertion, $trust, $recipient, $client_id);
+        if (!$samlResult['valid']) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Assertion SAML inválida: ' . $samlResult['error']], 400);
+        }
+
+        $username = $samlResult['subject'] ?? null;
+        if (!$username) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Subject (NameID) ausente na assertion'], 400);
+        }
+
+        // Mapear NameID para usuário existente no sistema (opcional, para consistência)
+        global $users;
+        if (!isset($users[$username])) {
+            return jsonResponse(['error' => 'invalid_grant', 'error_description' => 'Usuário não encontrado para Subject: ' . $username], 400);
+        }
+
         if (!$scope) {
             $scope = 'openid profile';
         }
@@ -1764,6 +2228,7 @@ function handleWellKnown() {
             'urn:ietf:params:oauth:grant-type:device_code',
             'device_code',
             'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'urn:ietf:params:oauth:grant-type:saml2-bearer',
             'urn:ietf:params:oauth:grant-type:token-exchange'
         ],
         'subject_types_supported' => ['public'],
