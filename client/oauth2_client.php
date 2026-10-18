@@ -4,6 +4,12 @@
  */
 
 session_start();
+if (isset($_GET['store_verifier'])) {
+    $_SESSION['oauth_code_verifier'] = $_GET['store_verifier'];
+    header('Content-Type: application/json');
+    echo json_encode(['ok' => true]);
+    exit;
+}
 
 // ============================================================================
 // CONFIGURAÇÕES
@@ -247,6 +253,70 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['implicit_callback']))
 
     unset($_SESSION['oauth_state']);
     unset($_SESSION['oauth_nonce']);
+    header('Location: ' . $redirect_uri);
+    exit;
+}
+
+// ============================================================================
+// PROCESSAR CALLBACK COM HYBRID FLOW (OIDC Core 1.0)
+// ============================================================================
+// Code pode vir na query; tokens (se vierem sozinhos no fragment) são tratados via JS.
+// Também processamos code recebido via GET após redirect híbrido (code na query)
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['code']) && !isset($_GET['logout'])) {
+    $code = $_GET['code'] ?? '';
+    $state = $_GET['state'] ?? '';
+
+    if ($state !== '' && isset($_SESSION['oauth_state']) && $state === $_SESSION['oauth_state']) {
+        // Tentar trocar code por token se ainda não temos token
+        if (empty($_SESSION['access_token'])) {
+            $code_verifier = $_SESSION['oauth_code_verifier'] ?? null;
+            $token_data = [
+                'grant_type' => 'authorization_code',
+                'code' => $code,
+                'redirect_uri' => $redirect_uri,
+                'client_id' => $client_id,
+                'client_secret' => $client_secret,
+            ];
+            if ($code_verifier) {
+                $token_data['code_verifier'] = $code_verifier;
+            }
+
+            $token_response = makeRequest('POST', $oauth_server . '/oauth2_complete.php?action=token', $token_data);
+
+            if ($token_response['status'] === 200 && isset($token_response['data']['access_token'])) {
+                $_SESSION['access_token'] = $token_response['data']['access_token'];
+                $_SESSION['token_data'] = $token_response['data'];
+                $_SESSION['flow_used'] = 'hybrid';
+
+                if (!empty($token_response['data']['id_token'])) {
+                    $validation = validateIdToken($token_response['data']['id_token'], $_SESSION['oauth_nonce'] ?? null);
+                    if ($validation['valid']) {
+                        $_SESSION['id_token_claims'] = $validation['payload'];
+                    } else {
+                        $_SESSION['id_token_error'] = $validation['error'];
+                    }
+                }
+
+                $userinfo_response = makeRequest(
+                    'GET',
+                    $oauth_server . '/oauth2_complete.php?action=userinfo',
+                    null,
+                    ['Authorization: Bearer ' . $_SESSION['access_token']]
+                );
+                if ($userinfo_response['status'] === 200) {
+                    $_SESSION['user_data'] = $userinfo_response['data'];
+                }
+            } else {
+                $_SESSION['error'] = 'Erro ao trocar code por token: ' . ($token_response['data']['error_description'] ?? json_encode($token_response['data']));
+            }
+        }
+    } else {
+        $_SESSION['error'] = 'State mismatch no Hybrid Flow';
+    }
+
+    unset($_SESSION['oauth_state']);
+    unset($_SESSION['oauth_nonce']);
+    unset($_SESSION['oauth_code_verifier']);
     header('Location: ' . $redirect_uri);
     exit;
 }
@@ -911,6 +981,10 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     🔄 Token Exchange<br>
                     <small>RFC 8693</small>
                 </a>
+                <a href="?flow=hybrid" class="flow-button <?php echo $flow_type === 'hybrid' ? 'active' : ''; ?>">
+                    🔀 Hybrid Flow<br>
+                    <small>OIDC Core 1.0</small>
+                </a>
             </div>
             
             <!-- AUTHORIZATION CODE FLOW -->
@@ -1250,6 +1324,16 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     const el = document.getElementById('device-error');
                     el.textContent = msg;
                     el.style.display = 'block';
+
+                document.querySelector('form[action*="authorize"]').addEventListener('submit', function(e) {
+                    const chk = document.getElementById('hybrid_use_pkce');
+                    if (chk && chk.checked) {
+                        const v = document.getElementById('hybrid_code_verifier').value;
+                        if (v) {
+                            fetch(window.location.pathname + '?store_verifier=' + encodeURIComponent(v));
+                        }
+                    }
+                });
                 }
                 </script>
             <?php endif; ?>
@@ -1398,6 +1482,16 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     } catch (error) {
                         document.getElementById('jwt-result').innerHTML = '<div class="error">✗ Erro na requisição: ' + error.message + '</div>';
                     }
+
+                document.querySelector('form[action*="authorize"]').addEventListener('submit', function(e) {
+                    const chk = document.getElementById('hybrid_use_pkce');
+                    if (chk && chk.checked) {
+                        const v = document.getElementById('hybrid_code_verifier').value;
+                        if (v) {
+                            fetch(window.location.pathname + '?store_verifier=' + encodeURIComponent(v));
+                        }
+                    }
+                });
                 }
                 </script>
             <?php endif; ?>
@@ -1490,10 +1584,150 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
                     .catch(err => {
                         result.innerHTML = '<div class="error">✗ Erro na requisição: ' + err.message + '</div>';
                     });
+
+                document.querySelector('form[action*="authorize"]').addEventListener('submit', function(e) {
+                    const chk = document.getElementById('hybrid_use_pkce');
+                    if (chk && chk.checked) {
+                        const v = document.getElementById('hybrid_code_verifier').value;
+                        if (v) {
+                            fetch(window.location.pathname + '?store_verifier=' + encodeURIComponent(v));
+                        }
+                    }
+                });
                 }
                 </script>
             <?php endif; ?>
             
+
+            <?php if ($flow_type === 'hybrid'): ?>
+                <div class="card">
+                    <h2>🔀 Hybrid Flow (OIDC Core 1.0)</h2>
+                    
+                    <div class="info-box">
+                        <strong>Como funciona:</strong>
+                        <ol style="margin-left: 1.5rem; margin-top: 0.5rem;">
+                            <li>Authorization Endpoint retorna <code>code</code> na query E tokens (<code>access_token</code> e/ou <code>id_token</code>) no fragment</li>
+                            <li>O <code>code</code> pode ser trocado no Token Endpoint (Authorization Code Flow)</li>
+                            <li>Tokens já recebidos no fragment podem ser usados imediatamente</li>
+                        </ol>
+                    </div>
+
+                    <form method="GET" action="<?php echo $oauth_server; ?>/oauth2_complete.php">
+                        <input type="hidden" name="action" value="authorize">
+                        
+                        <div class="form-group">
+                            <label>Client ID:</label>
+                            <input type="text" name="client_id" value="cliente_teste" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Redirect URI:</label>
+                            <input type="text" name="redirect_uri" value="<?php echo htmlspecialchars($redirect_uri); ?>" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Response Type:</label>
+                            <select name="response_type" id="hybrid_response_type" onchange="toggleHybridNonce()">
+                                <option value="code token">code token</option>
+                                <option value="code id_token">code id_token</option>
+                                <option value="code id_token token">code id_token token</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Scope:</label>
+                            <input type="text" name="scope" value="openid profile" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>State:</label>
+                            <input type="text" name="state" id="hybrid_state" value="<?php echo bin2hex(random_bytes(8)); ?>" required>
+                        </div>
+                        
+                        <div class="form-group" id="hybrid_nonce_group">
+                            <label>Nonce (obrigatório quando id_token presente):</label>
+                            <input type="text" name="nonce" id="hybrid_nonce" value="<?php echo bin2hex(random_bytes(8)); ?>">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Response Mode (opcional):</label>
+                            <select name="response_mode">
+                                <option value="">Padrão (code na query + tokens no fragment)</option>
+                                <option value="fragment">Tudo no fragment</option>
+                                <option value="query">Tudo na query</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="hybrid_use_pkce" onchange="toggleHybridPkce()"> Usar PKCE (recomendado)
+                            </label>
+                        </div>
+                        
+                        <div id="hybrid_pkce_fields" style="display:none; margin-top:1rem; padding:1rem; background:#f8f9fa; border-radius:8px;">
+                            <div class="form-group">
+                                <label>Code Verifier:</label>
+                                <input type="text" id="hybrid_code_verifier" value="<?php echo rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '='); ?>">
+                            </div>
+                            <div class="form-group">
+                                <label>Code Challenge (S256):</label>
+                                <input type="text" id="hybrid_code_challenge" readonly>
+                            </div>
+                            <input type="hidden" name="code_challenge_method" value="S256">
+                            <input type="hidden" name="code_challenge" id="hybrid_code_challenge_hidden">
+                        </div>
+                        
+                        <button type="submit" style="width: 100%;">🚀 Iniciar Hybrid Flow</button>
+                    </form>
+                </div>
+                
+                <script>
+                function toggleHybridNonce() {
+                    const rt = document.getElementById('hybrid_response_type').value;
+                    const grp = document.getElementById('hybrid_nonce_group');
+                    if (rt.includes('id_token')) {
+                        grp.style.display = 'block';
+                    } else {
+                        grp.style.display = 'none';
+                    }
+                }
+                toggleHybridNonce();
+                
+                async function generateHybridPkce() {
+                    const verifier = document.getElementById('hybrid_code_verifier').value;
+                    const encoder = new TextEncoder();
+                    const data = encoder.encode(verifier);
+                    const digest = await crypto.subtle.digest('SHA-256', data);
+                    const base64 = btoa(String.fromCharCode(...new Uint8Array(digest)))
+                        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                    document.getElementById('hybrid_code_challenge').value = base64;
+                    document.getElementById('hybrid_code_challenge_hidden').value = base64;
+                }
+                
+                function toggleHybridPkce() {
+                    const chk = document.getElementById('hybrid_use_pkce');
+                    const fields = document.getElementById('hybrid_pkce_fields');
+                    if (chk.checked) {
+                        fields.style.display = 'block';
+                        generateHybridPkce();
+                        // salvar verifier na sessão via fetch? simples: vamos armazenar via cookie/localStorage não é possível direto; 
+                        // melhor guardar em sessionStorage e também enviar via form? adicionamos hidden
+                    } else {
+                        fields.style.display = 'none';
+                    }
+
+                document.querySelector('form[action*="authorize"]').addEventListener('submit', function(e) {
+                    const chk = document.getElementById('hybrid_use_pkce');
+                    if (chk && chk.checked) {
+                        const v = document.getElementById('hybrid_code_verifier').value;
+                        if (v) {
+                            fetch(window.location.pathname + '?store_verifier=' + encodeURIComponent(v));
+                        }
+                    }
+                });
+                }
+                </script>
+            <?php endif; ?>
             <!-- INFORMAÇÕES E CREDENCIAIS -->
             <div class="grid">
                 <div class="card">
@@ -1568,7 +1802,7 @@ list($msg_type, $msg_text) = $message ? explode('|', $message, 2) : ['', ''];
             var el = document.getElementById('implicit-message');
             if (el) {
                 el.className = 'message erro';
-                el.textContent = 'State mismatch - possível ataque CSRF! Fluxo implicit abortado.';
+                el.textContent = 'State mismatch - possível ataque CSRF! Fluxo abortado.';
                 el.style.display = 'block';
             }
             return;

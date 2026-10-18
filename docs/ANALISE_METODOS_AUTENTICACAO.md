@@ -26,7 +26,7 @@ O ecossistema OAuth 2.0 / 2.1 e OpenID Connect define uma série de fluxos (*gra
 | **Public Clients (PKCE sem secret)** | OAuth 2.1 / RFC 7636 | ✅ Sim | 🔥 **PADRÃO OBRIGATÓRIO** | SPAs e Apps Mobile não devem ter `client_secret` |
 | **JWT Bearer Assertion** | RFC 7523 | ✅ Sim | 💼 **MUITO UTILIZADO (Enterprise)** | Padrão de Service Accounts (Google Cloud, Salesforce) |
 | **Token Exchange** | RFC 8693 | ✅ Sim | 🏢 **MÉDIO/ENTERPRISE** | Usado em malhas de microsserviços / delegação |
-| **OIDC Hybrid Flow** | OIDC Core 1.0 | ❌ **Falta** | ⏳ **EM DECLÍNIO** | Pouco usado em novos projetos; superado por Code + PKCE |
+| **OIDC Hybrid Flow** | OIDC Core 1.0 | ✅ Sim | ⏳ **EM DECLÍNIO** | Pouco usado em novos projetos; superado por Code + PKCE |
 | **SAML 2.0 Assertion** | RFC 7522 | ❌ **Falta** | 🏛️ **LEGADO CORPORATIVO** | Apenas para migração de SSO corporativo legado |
 | **MFA / TOTP no Login** | RFC 6238 | ❌ **Falta** | 🔥 **PADRÃO UNIVERSAL** | Autenticação do usuário final com segundo fator |
 
@@ -98,7 +98,7 @@ flowchart TD
     end
 
     subgraph Fase3["Fase 3: Opcional / Específico"]
-        G["OIDC Hybrid Flow / SAML 2.0 (legado)"]
+        G["OIDC Hybrid Flow ✅ / SAML 2.0 (legado)"]
     end
 
     Fase1 --> Fase2 --> Fase3
@@ -235,7 +235,21 @@ Resposta:
 
 ---
 
-### 5.6 Componente Pendente: MFA / TOTP no Login (RFC 6238)
+### 5.6 Componente Implementado: OIDC Hybrid Flow (OIDC Core 1.0) ✅
+
+> Implementado em `server/oauth2_complete.php`: `redirectWithError()` detecta fragmento para response_types com `token`/`id_token`; `handleAuthorize()` lê `response_mode` e exige `nonce` quando `id_token` presente; `completeAuthorization()` trata híbridos (`code token`, `code id_token`, `code id_token token`) gerando `code` em query + tokens em fragmento (default). Clientes `cliente_teste` e `spa_publica` atualizados com response_types híbridos. Aba "🔀 Hybrid Flow" adicionada ao `client/oauth2_client.php` com parsing de query+fragment e troca automática do `code` por token.
+
+**Comportamento:**
+- `code token` → `?code=XXX#access_token=YYY&token_type=Bearer&expires_in=3600&scope=...&state=...`
+- `code id_token` (com nonce) → `?code=XXX#id_token=JWT&state=...`
+- `code id_token token` → `?code=XXX#access_token=YYY&id_token=ZZZ&token_type=Bearer&expires_in=3600&scope=...&state=...`
+
+O `code` gerado continua válido para troca via `grant_type=authorization_code` no token endpoint.
+
+---
+
+### 5.7 Componente Pendente: MFA / TOTP no Login (RFC 6238)
+
 
 * Gerar segredo TOTP por usuário no primeiro login e exibir QR Code (otpauth:// URI).
 * No `handleLogin()` / `handleAuthorize()`, exigir o código de 6 dígitos antes de emitir o authorization code.
@@ -255,7 +269,14 @@ Resposta:
 5. **Token Exchange:** trocar um `access_token` (subset de escopo) e validar `issued_token_type`; escopo maior retorna `invalid_scope`; `actor_token` inválido retorna `invalid_grant`; `audience` não permitida retorna `invalid_target`; o `subject_token` original permanece válido.
 
 **Pendentes (novos métodos):**
-6. **MFA / TOTP:**
+6. **Hybrid Flow (OIDC):**
+   * `code token` retorna `code` em query + `access_token` em fragmento
+   * `code id_token` com `nonce` retorna `code` em query + `id_token` em fragmento
+   * `code id_token token` com `nonce` retorna code + tokens conforme esperado
+   * `code id_token` sem `nonce` retorna `error=invalid_request`
+   * `code` gerado em híbrido pode ser trocado com sucesso no token endpoint
+
+7. **MFA / TOTP:**
    * Login com código TOTP válido aprova; código inválido/expirado é rejeitado; reutilização do mesmo código é bloqueada.
 
 ### 6.2 Testes Manuais
@@ -263,5 +284,6 @@ Resposta:
 * Abrir a aba **JWT Bearer**, gerar o JWT e solicitar o token.
 * Abrir a aba **Token Exchange**, colar um `access_token` obtido em outro flow, informar um `scope` menor (ex.: `openid`) e solicitar o token.
 * Testar `?action=introspect` com um token ativo e outro revogado.
+* Abrir a aba **Hybrid Flow**, testar `code token`, `code id_token` (com nonce) e `code id_token token`. Verificar que `code` é trocado automaticamente e tokens aparecem na sessão.
 * Testar o cliente público `spa_publica` (fluxo Authorization Code com PKCE, sem `client_secret`).
 

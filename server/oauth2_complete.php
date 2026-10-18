@@ -64,7 +64,7 @@ $clients = [
             'http://localhost:8001/callback.php',
             'http://localhost:3000/callback',
         ],
-        'response_types' => ['code', 'token', 'id_token', 'id_token token'],
+        'response_types' => ['code', 'token', 'id_token', 'id_token token', 'code token', 'code id_token', 'code id_token token'],
         'grant_types' => ['authorization_code', 'refresh_token', 'implicit', 'urn:ietf:params:oauth:grant-type:device_code', 'device_code', 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'urn:ietf:params:oauth:grant-type:token-exchange'],
         'allowed_audiences' => ['http://localhost:8000/api', 'api://gateway'],
         'token_endpoint_auth_method' => 'client_secret_basic',
@@ -90,7 +90,7 @@ $clients = [
             'http://localhost:3000/callback',
             'http://localhost:8001/oauth2_client.php',
         ],
-        'response_types' => ['code'],
+        'response_types' => ['code', 'code token', 'code id_token', 'code id_token token'],
         'grant_types' => ['authorization_code', 'refresh_token'],
         'token_endpoint_auth_method' => 'none',
     ],
@@ -336,7 +336,7 @@ function redirect($url) {
 
 /**
  * Devolve um erro OAuth2 ao cliente via redirect (com state), usando '#' quando
- * a resposta usa fragment (implicit) e '?' no authorization code flow.
+ * a resposta usa fragment (implicit/hybrid) e '?' no authorization code flow.
  */
 function redirectWithError($redirect_uri, $error, $description, $state, $response_type = 'code') {
     $params = ['error' => $error];
@@ -347,7 +347,7 @@ function redirectWithError($redirect_uri, $error, $description, $state, $respons
         $params['state'] = $state;
     }
 
-    $is_fragment = in_array($response_type, ['token', 'id_token', 'id_token token'], true);
+    $is_fragment = (strpos($response_type, 'token') !== false || strpos($response_type, 'id_token') !== false);
     redirect($redirect_uri . ($is_fragment ? '#' : '?') . http_build_query($params));
 }
 
@@ -405,7 +405,7 @@ function grantConsent($client_id, array $scopes) {
 }
 
 /**
- * Emite a resposta final da autorização: tokens (implicit) ou authorization code.
+ * Emite a resposta final da autorização: tokens (implicit), authorization code ou hybrid flow.
  */
 function completeAuthorization(array $authParams, $username) {
     global $config;
@@ -416,8 +416,64 @@ function completeAuthorization(array $authParams, $username) {
     $state = $authParams['state'];
     $nonce = $authParams['nonce'];
     $response_type = $authParams['response_type'];
+    $response_mode = $authParams['response_mode'] ?? null;
 
     $storage = loadStorage();
+
+    $has_code = strpos($response_type, 'code') !== false;
+    $has_token = strpos($response_type, 'token') !== false;
+    $has_id_token = strpos($response_type, 'id_token') !== false;
+
+    // OIDC Hybrid Flow: retorna code + tokens na mesma resposta
+    if ($has_code && ($has_token || $has_id_token)) {
+        $storage['auth_codes'] = $storage['auth_codes'] ?? [];
+
+        $code = generateCode();
+        $storage['auth_codes'][$code] = [
+            'client_id' => $client_id,
+            'username' => $username,
+            'scope' => $scope,
+            'redirect_uri' => $redirect_uri,
+            'nonce' => $nonce,
+            'response_type' => $response_type,
+            'code_challenge' => $authParams['code_challenge'] ?? null,
+            'code_challenge_method' => $authParams['code_challenge_method'] ?? null,
+            'created_at' => time(),
+            'expires_at' => time() + $config['code_expires'],
+        ];
+        saveStorage($storage);
+
+        $query_params = [
+            'code' => $code,
+            'state' => $state,
+        ];
+        $fragment_params = [];
+
+        if ($has_token) {
+            $fragment_params['access_token'] = createAccessToken($storage, $client_id, $username, $scope);
+            $fragment_params['token_type'] = 'Bearer';
+            $fragment_params['expires_in'] = $config['access_token_expires'];
+            $fragment_params['scope'] = $scope;
+        }
+
+        if ($has_id_token) {
+            $fragment_params['id_token'] = generateIdToken($username, $client_id, $nonce);
+        }
+
+        saveStorage($storage);
+
+        if ($response_mode === 'fragment') {
+            redirect($redirect_uri . '#' . http_build_query(array_merge($query_params, $fragment_params)));
+            return;
+        } elseif ($response_mode === 'query') {
+            redirect($redirect_uri . '?' . http_build_query(array_merge($query_params, $fragment_params)));
+            return;
+        } else {
+            // Default: code em query + tokens em fragmento
+            redirect($redirect_uri . '?' . http_build_query($query_params) . '#' . http_build_query($fragment_params));
+            return;
+        }
+    }
 
     // Implicit Flow: tokens retornados diretamente no fragment (#), sem token exchange
     if (in_array($response_type, ['token', 'id_token', 'id_token token'], true)) {
@@ -437,6 +493,7 @@ function completeAuthorization(array $authParams, $username) {
         saveStorage($storage);
 
         redirect($redirect_uri . '#' . http_build_query($response_params));
+        return;
     }
 
     // Authorization Code Flow: gerar code de uso único
@@ -573,6 +630,7 @@ function handleAuthorize() {
     $login_hint = trim($_REQUEST['login_hint'] ?? '');
     $code_challenge = $_REQUEST['code_challenge'] ?? null;
     $code_challenge_method = $_REQUEST['code_challenge_method'] ?? null;
+    $response_mode = $_REQUEST['response_mode'] ?? null;
 
     // Validações iniciais (sem redirect_uri validado ainda não é seguro redirecionar)
     if (!$client_id || !isset($clients[$client_id])) {
@@ -611,6 +669,11 @@ function handleAuthorize() {
         $code_challenge_method = null;
     }
 
+    // OIDC Hybrid Flow: nonce obrigatório quando id_token é solicitado
+    if (strpos($response_type, 'id_token') !== false && ($nonce === null || $nonce === '')) {
+        return redirectWithError($redirect_uri, 'invalid_request', 'nonce é obrigatório quando response_type contém id_token', $state, $response_type);
+    }
+
     $authParams = [
         'client_id' => $client_id,
         'redirect_uri' => $redirect_uri,
@@ -618,9 +681,9 @@ function handleAuthorize() {
         'state' => $state,
         'nonce' => $nonce,
         'response_type' => $response_type,
-        'prompt' => $prompt,
         'code_challenge' => $code_challenge,
         'code_challenge_method' => $code_challenge_method,
+        'response_mode' => $response_mode,
     ];
 
     // ===================== Autenticação (separada do consentimento) =====================
