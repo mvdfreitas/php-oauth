@@ -1,0 +1,28 @@
+{
+    "name": "projeto/php-oauth",
+    "description": "Servidor OAuth2 completo em PHP 8.5",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": "^8.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/"
+        },
+        "files": [
+            "app/Helpers/functions.php"
+        ]
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true,
+        "platform": {
+            "php": "8.5.0"
+        }
+    },
+    "scripts": {
+        "start": "php -S localhost:8000 -t public",
+        "dump": "composer dump-autoload -o"
+    }
+}
