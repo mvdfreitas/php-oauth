@@ -1,0 +1,26 @@
+# Composer
+/vendor/
+
+# Storage local (tokens, codes e dados sensíveis)
+/storage/*.json
+/storage/*.log
+
+# Ambiente
+.env
+.env.*
+!.env.example
+
+# Ferramentas
+.phpunit.cache/
+.phpstan.cache/
+.php-cs-fixer.cache
+/build/
+
+# Editores / SO
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log
